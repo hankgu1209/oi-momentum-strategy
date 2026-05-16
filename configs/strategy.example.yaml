@@ -1,0 +1,78 @@
+exchange:
+  name: binance_usdm
+  websocket_url: "wss://fstream.binance.com/market/stream?streams=!miniTicker@arr"
+  rest_base_url: "https://fapi.binance.com"
+  request_timeout_seconds: 15
+  rest_retries: 5
+
+universe:
+  quote_asset: "USDT"
+  include_symbols: []
+  exclude_symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"
+    - "SOLUSDT"
+    - "BNBUSDT"
+    
+  min_24h_quote_volume: 10000000
+  max_24h_quote_volume: 500000000
+
+signal:
+  windows_seconds: [60]
+  primary_window_seconds: 60
+  long_return_thresholds:
+    60: 0.03
+  short_return_thresholds:
+    60: -0.03
+  kline_interval: "1m"
+  kline_lookback: 30
+  kline_close_delay_ms: 1500
+  long_close_position_min: 0.95
+  short_close_position_max: 0.05
+  volume_ratio_min: 2.0
+  oi_value_to_volume_ratio_min: 0.15
+  taker_buy_ratio_min_for_long: 0.60
+  taker_sell_ratio_min_for_short: 0.60
+  oi_sample_interval_seconds: 10
+  oi_delta_pct_min: 0.05
+  signal_cooldown_seconds: 300
+  score_probe_min: 70
+  score_add_min: 85
+  score_exit_threshold: 50
+
+execution:
+  mode: "research"
+  probe_position_fraction: 0.20
+  first_add_position_fraction: 0.40
+  second_add_position_fraction: 0.40
+  max_position_fraction: 1.00
+  order_type: "market"
+  reduce_only_exits: true
+
+risk:
+  initial_equity_usdt: 10000
+  account_risk_per_trade: 0.003
+  max_daily_loss: 0.025
+  max_consecutive_losses: 3
+  max_simultaneous_positions: 3
+  max_same_direction_positions: 2
+  max_spread_pct: 0.003
+  max_estimated_slippage_pct: 0.005
+  min_depth_multiplier: 5
+  symbol_cooldown_after_loss_seconds: 600
+  system_cooldown_after_loss_streak_seconds: 3600
+
+exit:
+  stop_loss_pct: 0.012
+  take_profit_pct: 0.018
+  max_hold_seconds: 900
+  failure_exit_seconds: 60
+  failure_reversal_pct: 0.006
+  first_take_profit_r: 0.8
+  first_take_profit_fraction: 0.40
+  second_take_profit_r: 1.8
+  second_take_profit_fraction: 0.30
+  trailing_window_seconds: 30
+
+storage:
+  database_url: "sqlite:///data/events.sqlite3"

@@ -1,0 +1,2 @@
+[console_scripts]
+oi-momentum-scan = binance_oi_momentum.cli:run_scanner
