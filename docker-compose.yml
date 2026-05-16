@@ -7,6 +7,7 @@ services:
     command: ["oi-momentum-scan", "--config", "configs/strategy.example.yaml"]
     environment:
       TZ: Asia/Shanghai
+      LOG_LEVEL: INFO
       # If your server needs a proxy to reach Binance, uncomment and edit:
       # HTTP_PROXY: http://host.docker.internal:7890
       # HTTPS_PROXY: http://host.docker.internal:7890
@@ -27,17 +28,42 @@ services:
         "--server.address=0.0.0.0",
         "--server.port=8501",
         "--server.headless=true",
+        "--logger.level=info",
       ]
     environment:
       TZ: Asia/Shanghai
+      LOG_LEVEL: INFO
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
       # If your server needs a proxy to reach Binance, uncomment and edit:
       # HTTP_PROXY: http://host.docker.internal:7890
       # HTTPS_PROXY: http://host.docker.internal:7890
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
     volumes:
       - ./configs:/app/configs
       - ./data:/app/data
     depends_on:
       - scanner
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: oi-momentum-caddy
+    restart: unless-stopped
+    profiles: ["domain"]
+    environment:
+      DASHBOARD_DOMAIN: ${DASHBOARD_DOMAIN:-localhost}
+      DASHBOARD_USER: ${DASHBOARD_USER:-admin}
+      DASHBOARD_PASSWORD_HASH: ${DASHBOARD_PASSWORD_HASH:-not-configured}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dashboard
+
+volumes:
+  caddy_data:
+  caddy_config:

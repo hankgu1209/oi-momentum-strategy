@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -10,6 +11,9 @@ import aiohttp
 import websockets
 
 from .models import KlineVolumeContext, OIContext, PriceTick
+
+
+logger = logging.getLogger(__name__)
 
 
 class BinanceMarketClient:
@@ -113,12 +117,14 @@ class BinanceMarketClient:
     async def mini_ticker_stream(self) -> AsyncIterator[list[PriceTick]]:
         while True:
             try:
+                logger.info("connecting websocket url=%s", self.websocket_url)
                 async with websockets.connect(
                     self.websocket_url,
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=5,
                 ) as websocket:
+                    logger.info("websocket connected")
                     async for raw_message in websocket:
                         payload = json.loads(raw_message)
                         data = payload.get("data", payload)
@@ -127,6 +133,7 @@ class BinanceMarketClient:
                         ticks = [self._parse_mini_ticker(item) for item in data]
                         yield [tick for tick in ticks if tick is not None]
             except Exception:
+                logger.exception("websocket disconnected, reconnecting after delay")
                 await asyncio.sleep(5)
 
     async def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -139,6 +146,14 @@ class BinanceMarketClient:
                         return await response.json()
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_error = exc
+                logger.warning(
+                    "rest request failed path=%s attempt=%s/%s error=%s: %s",
+                    path,
+                    attempt,
+                    self.rest_retries,
+                    type(exc).__name__,
+                    exc,
+                )
                 await asyncio.sleep(min(2**attempt, 30))
 
         assert last_error is not None

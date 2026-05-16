@@ -1,0 +1,14 @@
+{$DASHBOARD_DOMAIN} {
+    log {
+        output stdout
+        format console
+    }
+
+    encode zstd gzip
+
+    basicauth {
+        {$DASHBOARD_USER} {$DASHBOARD_PASSWORD_HASH}
+    }
+
+    reverse_proxy dashboard:8501
+}

@@ -143,7 +143,9 @@ Useful commands:
 
 ```bash
 docker compose ps
+docker compose logs -f scanner dashboard
 docker compose logs -f dashboard
+docker compose logs --tail=200 scanner
 docker compose restart scanner
 docker compose down
 ```
@@ -155,6 +157,20 @@ config reloaded from configs/strategy.example.yaml
 ```
 
 No image rebuild is needed for threshold changes. If you change exchange URLs, mounted paths, or code, restart/rebuild the containers.
+
+### Logs And Invalid HTTP Requests
+
+The containers write structured logs to stdout, so Docker logs are the first place to inspect runtime behavior:
+
+```bash
+docker compose logs -f scanner dashboard
+docker compose logs --tail=200 scanner
+docker compose logs --tail=200 dashboard
+```
+
+Set `LOG_LEVEL=DEBUG` in `docker-compose.yml` if you need more detail, then restart the containers.
+
+If the dashboard prints `Invalid HTTP request received`, it usually means a client is sending non-HTTP or HTTPS/TLS traffic to the plain HTTP Streamlit port `8501`. This often comes from public internet scanners, browser attempts to open `https://<ip>:8501`, load balancer health checks using HTTPS, or Tencent Cloud probes. The message is emitted before Streamlit passes a request into the app, so the app cannot log the request path or source IP. Prefer opening port `8501` only to your own IP, or keep it private and use an SSH tunnel.
 
 ### Tencent Cloud Deployment
 
@@ -204,6 +220,54 @@ Then open:
 
 ```text
 http://localhost:8501
+```
+
+### Domain And HTTPS
+
+If you have a domain, use the bundled Caddy reverse proxy. Caddy terminates HTTPS on ports `80/443`, adds Basic Auth, and forwards traffic to the internal Streamlit dashboard. The dashboard port `8501` is bound to `127.0.0.1` only, so it is not exposed publicly by Docker.
+
+1. Add a DNS `A` record:
+
+```text
+dashboard.your-domain.com -> <server-public-ip>
+```
+
+2. On Tencent Cloud, open inbound TCP ports `80` and `443`. You do not need to open `8501`.
+
+3. Create a Caddy password hash on the server:
+
+```bash
+docker run --rm caddy:2-alpine caddy hash-password --plaintext 'your-strong-password'
+```
+
+4. Create `.env` from the example:
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Example:
+
+```text
+DASHBOARD_DOMAIN=dashboard.your-domain.com
+DASHBOARD_USER=admin
+DASHBOARD_PASSWORD_HASH='$2a$14$...'
+```
+
+Keep the password hash wrapped in single quotes so Docker Compose does not interpret the `$` characters.
+
+5. Start with the `domain` profile:
+
+```bash
+docker compose --profile domain up -d --build
+docker compose logs -f caddy dashboard scanner
+```
+
+Then open:
+
+```text
+https://dashboard.your-domain.com
 ```
 
 If Binance access times out from the server, add proxy environment variables in `docker-compose.yml` under both services, then restart:

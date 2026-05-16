@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import logging
 from pathlib import Path
 
 import altair as alt
@@ -10,10 +11,13 @@ import requests
 import streamlit as st
 
 from binance_oi_momentum.config import load_config, save_config
+from binance_oi_momentum.logging_utils import configure_logging
 from binance_oi_momentum.storage import SQLiteStorage, sqlite_path_from_url
 
 
 DEFAULT_CONFIG = "configs/strategy.example.yaml"
+configure_logging("dashboard")
+logger = logging.getLogger(__name__)
 
 
 @st.cache_data(ttl=3)
@@ -372,6 +376,17 @@ def render_config_editor(config_path: str, config) -> None:
 
     if submitted:
         save_config(config_path, config_dict)
+        logger.info(
+            "config saved path=%s scanner_enabled=%s primary_window=%s long_threshold=%s "
+            "short_threshold=%s volume_ratio_min=%s oi_delta_pct_min=%s",
+            config_path,
+            runtime.get("scanner_enabled"),
+            signal.get("primary_window_seconds"),
+            signal.get("long_return_thresholds"),
+            signal.get("short_return_thresholds"),
+            signal.get("volume_ratio_min"),
+            signal.get("oi_delta_pct_min"),
+        )
         st.success(f"Saved {config_path}. Backend scanner will hot-reload shortly.")
         st.cache_data.clear()
         st.rerun()
@@ -869,6 +884,13 @@ def main() -> None:
     config = load_config(config_path)
     SQLiteStorage(config.storage["database_url"])
     database_path = sqlite_path_from_url(config.storage["database_url"])
+    logger.info(
+        "dashboard render config=%s database=%s auto_refresh=%s refresh_seconds=%s",
+        config_path,
+        database_path,
+        auto_refresh,
+        refresh_seconds,
+    )
 
     heartbeat = read_table(
         str(database_path),

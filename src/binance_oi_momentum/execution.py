@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 from .models import Direction, PaperPosition, PositionStatus, SignalContext
 from .storage import SQLiteStorage
+
+
+logger = logging.getLogger(__name__)
 
 
 class PaperExecutionEngine:
@@ -64,6 +69,17 @@ class PaperExecutionEngine:
                 exit_reason=exit_reason,
                 pnl_usdt=pnl_usdt,
                 pnl_pct=pnl_pct,
+            )
+            logger.info(
+                "paper position closed position_id=%s symbol=%s direction=%s "
+                "reason=%s exit=%.8g pnl_usdt=%.4f pnl_pct=%.4f",
+                position.id,
+                position.symbol,
+                position.direction.value,
+                exit_reason,
+                price,
+                pnl_usdt,
+                pnl_pct,
             )
         return touched_position
 

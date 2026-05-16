@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -13,6 +14,9 @@ from .models import Direction, MarketSnapshot, PriceTick, SignalContext
 from .risk import evaluate_probe_risk
 from .storage import SQLiteStorage
 from .strategy import infer_candidate_direction, score_signal
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,6 +40,12 @@ class PendingCandidate:
 class SignalEvaluation:
     context: SignalContext | None
     log: dict
+
+
+def _safe_float(value: float | None) -> str:
+    if value is None:
+        return "none"
+    return f"{value:.4f}"
 
 
 class MarketScanner:
@@ -72,12 +82,16 @@ class MarketScanner:
                 self.symbols = await self._load_universe()
             except Exception as exc:
                 message = f"failed to load universe: {type(exc).__name__}: {exc}"
-                print(message, flush=True)
+                logger.warning(message)
                 self.storage.record_heartbeat(self._now_ms(), "waiting_rest", message)
                 await asyncio.sleep(30)
 
         self.storage.record_heartbeat(self._now_ms(), "running", f"universe={len(self.symbols)}")
-        print(f"scanner running, universe={len(self.symbols)}", flush=True)
+        logger.info(
+            "scanner running universe=%s enabled=%s",
+            len(self.symbols),
+            self._scanner_enabled(),
+        )
 
         async for ticks in self.client.mini_ticker_stream():
             await self._reload_config_if_changed()
@@ -87,6 +101,7 @@ class MarketScanner:
                 if now_ms - self._last_heartbeat_ms > 10_000:
                     self._last_heartbeat_ms = now_ms
                     self.storage.record_heartbeat(now_ms, "paused", "scanner_enabled=false")
+                    logger.info("scanner paused scanner_enabled=false")
                 continue
 
             for tick in ticks:
@@ -98,6 +113,7 @@ class MarketScanner:
             if now_ms - self._last_heartbeat_ms > 10_000:
                 self._last_heartbeat_ms = now_ms
                 self.storage.record_heartbeat(now_ms, "running", f"universe={len(self.symbols)}")
+                logger.info("heartbeat running universe=%s ticks=%s", len(self.symbols), len(ticks))
 
     async def _load_universe(self) -> set[str]:
         universe_config = self.config["universe"]
@@ -145,10 +161,11 @@ class MarketScanner:
 
         if old_universe != self.config.get("universe", {}):
             self.symbols = await self._load_universe()
+            logger.info("universe reloaded universe=%s", len(self.symbols))
 
         message = f"config reloaded from {self.config_path}"
         status = "running" if self._scanner_enabled() else "paused"
-        print(message, flush=True)
+        logger.info("%s status=%s", message, status)
         self.storage.record_heartbeat(now_ms, status, message)
 
     def _scanner_enabled(self) -> bool:
@@ -183,6 +200,16 @@ class MarketScanner:
         if pending is None:
             return
         state.pending_candidate = pending
+        logger.info(
+            "candidate queued symbol=%s direction=%s price=%.8g price_change_pct=%.4f "
+            "window_seconds=%s evaluate_after_ms=%s",
+            pending.tick.symbol,
+            pending.direction.value,
+            pending.tick.price,
+            pending.price_change_pct,
+            pending.window_seconds,
+            pending.evaluate_after_ms,
+        )
 
     def _build_pending_candidate(
         self,
@@ -218,8 +245,35 @@ class MarketScanner:
         self.storage.record_signal_check(evaluation.log)
         context = evaluation.context
         if context is None:
+            logger.info(
+                "candidate rejected symbol=%s direction=%s reason=%s price_change_pct=%.4f "
+                "volume_ratio=%s oi_delta_pct=%s taker_buy_ratio=%s taker_sell_ratio=%s score=%s",
+                pending.tick.symbol,
+                pending.direction.value,
+                evaluation.log.get("reject_reason"),
+                pending.price_change_pct,
+                _safe_float(evaluation.log.get("volume_ratio")),
+                _safe_float(evaluation.log.get("oi_delta_pct")),
+                _safe_float(evaluation.log.get("taker_buy_ratio")),
+                _safe_float(evaluation.log.get("taker_sell_ratio")),
+                _safe_float(evaluation.log.get("score")),
+            )
             return
 
+        logger.info(
+            "signal accepted symbol=%s direction=%s entry=%.8g price_change_pct=%.4f "
+            "volume_ratio=%.4f oi_delta_pct=%.4f taker_buy_ratio=%.4f "
+            "taker_sell_ratio=%.4f score=%.2f",
+            context.symbol,
+            context.direction.value,
+            context.trigger_price,
+            context.price_change_pct,
+            context.volume_ratio,
+            context.oi_delta_pct,
+            context.taker_buy_ratio,
+            context.taker_sell_ratio,
+            context.score,
+        )
         risk = evaluate_probe_risk(
             context,
             self.config["risk"],
@@ -245,10 +299,26 @@ class MarketScanner:
             },
         )
         state.last_signal_at_ms = context.timestamp_ms
+        logger.info(
+            "risk decision signal_id=%s symbol=%s allowed=%s reason=%s planned_fraction=%.4f",
+            signal_id,
+            context.symbol,
+            risk.allowed,
+            risk.reason,
+            risk.planned_position_fraction,
+        )
 
         if risk.allowed and self.config["execution"]["mode"] in {"research", "paper"}:
-            self.execution.open_probe_position(signal_id, context)
+            position_id = self.execution.open_probe_position(signal_id, context)
             self.storage.record_latest_price(context.symbol, context.timestamp_ms, context.trigger_price)
+            logger.info(
+                "paper position opened position_id=%s signal_id=%s symbol=%s direction=%s entry=%.8g",
+                position_id,
+                signal_id,
+                context.symbol,
+                context.direction.value,
+                context.trigger_price,
+            )
 
     def _snapshot(
         self,
@@ -290,9 +360,19 @@ class MarketScanner:
         )
         if isinstance(kline, Exception):
             log["raw"]["kline_error"] = f"{type(kline).__name__}: {kline}"
+            logger.warning(
+                "kline request failed symbol=%s error=%s",
+                pending.tick.symbol,
+                log["raw"]["kline_error"],
+            )
             return self._rejected_signal_evaluation(log, "kline_request_failed")
         if isinstance(oi, Exception):
             log["raw"]["open_interest_error"] = f"{type(oi).__name__}: {oi}"
+            logger.warning(
+                "open interest request failed symbol=%s error=%s",
+                pending.tick.symbol,
+                log["raw"]["open_interest_error"],
+            )
             return self._rejected_signal_evaluation(log, "open_interest_request_failed")
         if kline is None:
             return self._rejected_signal_evaluation(log, "missing_kline_data")
