@@ -92,15 +92,17 @@ Run the Streamlit dashboard in another terminal:
 streamlit run src/binance_oi_momentum/app.py
 ```
 
-The current implementation is a non-trading research and paper-trading logger. It subscribes to the Binance all-market mini ticker stream, keeps short rolling windows locally, fetches `openInterestHist` only after a price/volume candidate appears, records the trigger metrics into SQLite, and opens simulated positions with fixed stop loss, take profit, and max holding time. Do not connect live trading keys until the signal has been measured through backtest and paper trading.
+The current implementation is a non-trading research and paper-trading logger. It subscribes to the Binance all-market mini ticker stream, keeps short rolling windows locally, fetches Kline and `openInterestHist` data only after a price candidate appears, records both candidate checks and accepted signals into SQLite, and opens simulated positions with fixed stop loss, take profit, and max holding time. Do not connect live trading keys until the signal has been measured through backtest and paper trading.
+
+The dashboard `Config` tab includes a `Scanner enabled` switch. Turn it off and save before changing strategy parameters; the backend process stays alive and hot-reloads the YAML, but it stops processing market ticks and will not create new signals or paper positions. Turn it back on and save when you are ready to resume scanning.
 
 ## Signal Logic
 
 For each low-liquidity USDT perpetual symbol, the scanner:
 
 - Uses `!miniTicker@arr` WebSocket ticks to maintain a rolling 60s price window.
-- Creates a long candidate when the 60s price return is at least `+3%`.
-- Creates a short candidate when the 60s price return is at most `-3%`.
+- Creates a long candidate when the 60s price return is at least `+2%`.
+- Creates a short candidate when the 60s price return is at most `-2%`.
 - Does not trade immediately after the candidate appears.
 - Waits for the current 1m candle to close, then fetches `/fapi/v1/continuousKlines`.
 - Requires the latest closed 1m quote volume to be at least `2x` the average quote volume of the previous 30 one-minute candles.
@@ -109,7 +111,8 @@ For each low-liquidity USDT perpetual symbol, the scanner:
   - short: close position <= 5%
 - Requires taker buy quote volume ratio >= 60% for longs.
 - Requires taker sell quote volume ratio >= 60% for shorts.
-- Fetches `/futures/data/openInterestHist` and requires new OI / previous OI >= 5%.
+- Fetches `/futures/data/openInterestHist` and requires new OI / previous OI to meet the configured threshold.
+- Records every candidate check in the dashboard `Log` tab, including price change, Kline volume, taker buy/sell ratio, OI change, score, and reject reason.
 - Records every accepted signal and opens a paper position using the closed 1m candle close as entry price.
 
 ## Docker Deployment

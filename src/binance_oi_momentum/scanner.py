@@ -12,7 +12,7 @@ from .execution import PaperExecutionEngine
 from .models import Direction, MarketSnapshot, PriceTick, SignalContext
 from .risk import evaluate_probe_risk
 from .storage import SQLiteStorage
-from .strategy import infer_candidate_direction, passes_directional_flow, score_signal
+from .strategy import infer_candidate_direction, score_signal
 
 
 @dataclass
@@ -30,6 +30,12 @@ class PendingCandidate:
     window_seconds: int
     candle_close_time_ms: int
     evaluate_after_ms: int
+
+
+@dataclass(frozen=True)
+class SignalEvaluation:
+    context: SignalContext | None
+    log: dict
 
 
 class MarketScanner:
@@ -75,6 +81,14 @@ class MarketScanner:
 
         async for ticks in self.client.mini_ticker_stream():
             await self._reload_config_if_changed()
+            if not self._scanner_enabled():
+                self.states.clear()
+                now_ms = self._now_ms()
+                if now_ms - self._last_heartbeat_ms > 10_000:
+                    self._last_heartbeat_ms = now_ms
+                    self.storage.record_heartbeat(now_ms, "paused", "scanner_enabled=false")
+                continue
+
             for tick in ticks:
                 if tick.symbol not in self.symbols:
                     continue
@@ -133,8 +147,12 @@ class MarketScanner:
             self.symbols = await self._load_universe()
 
         message = f"config reloaded from {self.config_path}"
+        status = "running" if self._scanner_enabled() else "paused"
         print(message, flush=True)
-        self.storage.record_heartbeat(now_ms, "running", message)
+        self.storage.record_heartbeat(now_ms, status, message)
+
+    def _scanner_enabled(self) -> bool:
+        return bool(self.config.get("runtime", {}).get("scanner_enabled", True))
 
     async def _handle_tick(self, tick: PriceTick) -> None:
         state = self.states[tick.symbol]
@@ -196,18 +214,10 @@ class MarketScanner:
         if pending is None:
             return
 
-        context = await self._build_signal_context(pending)
+        evaluation = await self._build_signal_evaluation(pending)
+        self.storage.record_signal_check(evaluation.log)
+        context = evaluation.context
         if context is None:
-            return
-
-        if not passes_directional_flow(
-            direction=context.direction,
-            volume_ratio=context.volume_ratio,
-            taker_buy_ratio=context.taker_buy_ratio,
-            oi_delta_pct=context.oi_delta_pct,
-            oi_value_to_volume_ratio=context.oi_value_to_volume_ratio,
-            signal_config=self.config["signal"],
-        ):
             return
 
         risk = evaluate_probe_risk(
@@ -263,10 +273,11 @@ class MarketScanner:
             return_60s=returns.get(60),
         )
 
-    async def _build_signal_context(
+    async def _build_signal_evaluation(
         self,
         pending: PendingCandidate,
-    ) -> SignalContext | None:
+    ) -> SignalEvaluation:
+        log = self._base_signal_check_log(pending)
         kline, oi = await asyncio.gather(
             self.client.kline_volume_context(
                 pending.tick.symbol,
@@ -275,22 +286,49 @@ class MarketScanner:
                 end_time_ms=pending.candle_close_time_ms,
             ),
             self.client.open_interest_hist(pending.tick.symbol, period="5m", limit=2),
+            return_exceptions=True,
         )
-        if kline is None or oi is None:
-            return None
+        if isinstance(kline, Exception):
+            log["raw"]["kline_error"] = f"{type(kline).__name__}: {kline}"
+            return self._rejected_signal_evaluation(log, "kline_request_failed")
+        if isinstance(oi, Exception):
+            log["raw"]["open_interest_error"] = f"{type(oi).__name__}: {oi}"
+            return self._rejected_signal_evaluation(log, "open_interest_request_failed")
+        if kline is None:
+            return self._rejected_signal_evaluation(log, "missing_kline_data")
+        if oi is None:
+            return self._rejected_signal_evaluation(log, "missing_open_interest_data")
+
+        log.update(
+            {
+                "trigger_price": kline.close,
+                "quote_volume_usdt": kline.quote_volume_usdt,
+                "average_quote_volume_usdt": kline.average_quote_volume_usdt,
+                "volume_ratio": kline.volume_ratio,
+                "taker_buy_ratio": kline.taker_buy_ratio,
+                "taker_sell_ratio": kline.taker_sell_ratio,
+                "open_interest": oi.open_interest,
+                "previous_open_interest": oi.previous_open_interest,
+                "open_interest_value_usdt": oi.open_interest_value_usdt,
+                "oi_delta_pct": oi.delta_pct,
+                "oi_delta_value_usdt": oi.delta_value_usdt,
+            }
+        )
         if kline.quote_volume_usdt <= 0:
-            return None
+            return self._rejected_signal_evaluation(log, "zero_kline_quote_volume")
 
         close_position = self._close_position(kline.low, kline.high, kline.close)
+        log["close_position"] = close_position
         if close_position is None:
-            return None
+            return self._rejected_signal_evaluation(log, "invalid_candle_range")
         if pending.direction == Direction.LONG:
             if close_position < self.config["signal"]["long_close_position_min"]:
-                return None
+                return self._rejected_signal_evaluation(log, "long_close_below_required_range")
         elif close_position > self.config["signal"]["short_close_position_max"]:
-            return None
+            return self._rejected_signal_evaluation(log, "short_close_above_required_range")
 
         oi_value_to_volume_ratio = max(oi.delta_value_usdt, 0.0) / kline.quote_volume_usdt
+        log["oi_value_to_volume_ratio"] = oi_value_to_volume_ratio
         score = score_signal(
             direction=pending.direction,
             volume_ratio=kline.volume_ratio,
@@ -300,10 +338,21 @@ class MarketScanner:
             spread_pct=None,
             estimated_slippage_pct=None,
         )
+        log["score"] = score
         if score < self.config["signal"]["score_probe_min"]:
-            return None
+            return self._rejected_signal_evaluation(log, "score_below_min")
 
-        return SignalContext(
+        flow_reject_reason = self._directional_flow_reject_reason(
+            pending.direction,
+            volume_ratio=kline.volume_ratio,
+            taker_buy_ratio=kline.taker_buy_ratio,
+            oi_delta_pct=oi.delta_pct,
+            oi_value_to_volume_ratio=oi_value_to_volume_ratio,
+        )
+        if flow_reject_reason is not None:
+            return self._rejected_signal_evaluation(log, flow_reject_reason)
+
+        context = SignalContext(
             symbol=pending.tick.symbol,
             direction=pending.direction,
             timestamp_ms=kline.close_time_ms,
@@ -324,6 +373,65 @@ class MarketScanner:
             estimated_slippage_pct=None,
             score=score,
         )
+        log["passed"] = True
+        log["reject_reason"] = ""
+        return SignalEvaluation(context=context, log=log)
+
+    def _base_signal_check_log(self, pending: PendingCandidate) -> dict:
+        return {
+            "checked_at_ms": self._now_ms(),
+            "candidate_detected_at_ms": pending.tick.timestamp_ms,
+            "symbol": pending.tick.symbol,
+            "direction": pending.direction.value,
+            "window_seconds": pending.window_seconds,
+            "candidate_trigger_price": pending.tick.price,
+            "candle_close_time_ms": pending.candle_close_time_ms,
+            "price_change_pct": pending.price_change_pct,
+            "passed": False,
+            "reject_reason": "",
+            "raw": {
+                "candidate_evaluate_after_ms": pending.evaluate_after_ms,
+                "open_24h": pending.tick.open_24h,
+                "high_24h": pending.tick.high_24h,
+                "low_24h": pending.tick.low_24h,
+                "quote_volume_24h": pending.tick.quote_volume_24h,
+            },
+        }
+
+    @staticmethod
+    def _rejected_signal_evaluation(log: dict, reason: str) -> SignalEvaluation:
+        log["passed"] = False
+        log["reject_reason"] = reason
+        return SignalEvaluation(context=None, log=log)
+
+    def _directional_flow_reject_reason(
+        self,
+        direction: Direction,
+        *,
+        volume_ratio: float,
+        taker_buy_ratio: float,
+        oi_delta_pct: float,
+        oi_value_to_volume_ratio: float,
+    ) -> str | None:
+        signal_config = self.config["signal"]
+        if volume_ratio < signal_config["volume_ratio_min"]:
+            return "volume_ratio_below_min"
+
+        if oi_delta_pct < signal_config["oi_delta_pct_min"]:
+            return "oi_delta_pct_below_min"
+
+        if oi_value_to_volume_ratio < signal_config["oi_value_to_volume_ratio_min"]:
+            return "oi_value_to_volume_below_min"
+
+        if direction == Direction.LONG:
+            if taker_buy_ratio < signal_config["taker_buy_ratio_min_for_long"]:
+                return "taker_buy_ratio_below_min"
+            return None
+
+        taker_sell_ratio = 1.0 - taker_buy_ratio
+        if taker_sell_ratio < signal_config["taker_sell_ratio_min_for_short"]:
+            return "taker_sell_ratio_below_min"
+        return None
 
     @staticmethod
     def _return_for_window(snapshot: MarketSnapshot, window_seconds: int) -> float | None:

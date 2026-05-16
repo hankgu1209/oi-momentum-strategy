@@ -105,6 +105,40 @@ class SQLiteStorage:
                     updated_at_ms INTEGER NOT NULL,
                     price REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS signal_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    checked_at_ms INTEGER NOT NULL,
+                    candidate_detected_at_ms INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    window_seconds INTEGER NOT NULL,
+                    candidate_trigger_price REAL NOT NULL,
+                    candle_close_time_ms INTEGER NOT NULL,
+                    trigger_price REAL,
+                    price_change_pct REAL NOT NULL,
+                    quote_volume_usdt REAL,
+                    average_quote_volume_usdt REAL,
+                    volume_ratio REAL,
+                    taker_buy_ratio REAL,
+                    taker_sell_ratio REAL,
+                    open_interest REAL,
+                    previous_open_interest REAL,
+                    open_interest_value_usdt REAL,
+                    oi_delta_pct REAL,
+                    oi_delta_value_usdt REAL,
+                    oi_value_to_volume_ratio REAL,
+                    close_position REAL,
+                    score REAL,
+                    passed INTEGER NOT NULL,
+                    reject_reason TEXT NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_signal_checks_checked_at
+                    ON signal_checks(checked_at_ms);
+                CREATE INDEX IF NOT EXISTS idx_signal_checks_symbol
+                    ON signal_checks(symbol);
                 """
             )
             self._ensure_column(conn, "signals", "average_quote_volume_usdt", "REAL NOT NULL DEFAULT 0")
@@ -112,6 +146,79 @@ class SQLiteStorage:
             self._ensure_column(conn, "signals", "open_interest", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(conn, "signals", "open_interest_value_usdt", "REAL NOT NULL DEFAULT 0")
             self._ensure_position_journal_view(conn)
+
+    def record_signal_check(self, log: dict[str, Any]) -> int:
+        payload = {
+            "checked_at_ms": log.get("checked_at_ms"),
+            "candidate_detected_at_ms": log.get("candidate_detected_at_ms"),
+            "symbol": log.get("symbol"),
+            "direction": log.get("direction"),
+            "window_seconds": log.get("window_seconds"),
+            "candidate_trigger_price": log.get("candidate_trigger_price"),
+            "candle_close_time_ms": log.get("candle_close_time_ms"),
+            "trigger_price": log.get("trigger_price"),
+            "price_change_pct": log.get("price_change_pct"),
+            "quote_volume_usdt": log.get("quote_volume_usdt"),
+            "average_quote_volume_usdt": log.get("average_quote_volume_usdt"),
+            "volume_ratio": log.get("volume_ratio"),
+            "taker_buy_ratio": log.get("taker_buy_ratio"),
+            "taker_sell_ratio": log.get("taker_sell_ratio"),
+            "open_interest": log.get("open_interest"),
+            "previous_open_interest": log.get("previous_open_interest"),
+            "open_interest_value_usdt": log.get("open_interest_value_usdt"),
+            "oi_delta_pct": log.get("oi_delta_pct"),
+            "oi_delta_value_usdt": log.get("oi_delta_value_usdt"),
+            "oi_value_to_volume_ratio": log.get("oi_value_to_volume_ratio"),
+            "close_position": log.get("close_position"),
+            "score": log.get("score"),
+            "passed": bool(log.get("passed", False)),
+            "reject_reason": log.get("reject_reason", ""),
+            "raw": log.get("raw", {}),
+        }
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO signal_checks(
+                    checked_at_ms, candidate_detected_at_ms, symbol, direction,
+                    window_seconds, candidate_trigger_price, candle_close_time_ms,
+                    trigger_price, price_change_pct, quote_volume_usdt,
+                    average_quote_volume_usdt, volume_ratio, taker_buy_ratio,
+                    taker_sell_ratio, open_interest, previous_open_interest,
+                    open_interest_value_usdt, oi_delta_pct, oi_delta_value_usdt,
+                    oi_value_to_volume_ratio, close_position, score, passed,
+                    reject_reason, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["checked_at_ms"],
+                    payload["candidate_detected_at_ms"],
+                    payload["symbol"],
+                    payload["direction"],
+                    payload["window_seconds"],
+                    payload["candidate_trigger_price"],
+                    payload["candle_close_time_ms"],
+                    payload["trigger_price"],
+                    payload["price_change_pct"],
+                    payload["quote_volume_usdt"],
+                    payload["average_quote_volume_usdt"],
+                    payload["volume_ratio"],
+                    payload["taker_buy_ratio"],
+                    payload["taker_sell_ratio"],
+                    payload["open_interest"],
+                    payload["previous_open_interest"],
+                    payload["open_interest_value_usdt"],
+                    payload["oi_delta_pct"],
+                    payload["oi_delta_value_usdt"],
+                    payload["oi_value_to_volume_ratio"],
+                    payload["close_position"],
+                    payload["score"],
+                    int(payload["passed"]),
+                    payload["reject_reason"],
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            return int(cursor.lastrowid)
 
     def record_heartbeat(self, timestamp_ms: int, status: str, message: str = "") -> None:
         with self.connect() as conn:

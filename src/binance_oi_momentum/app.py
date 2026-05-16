@@ -113,6 +113,7 @@ def render_config_editor(config_path: str, config) -> None:
     st.caption("保存后会写入 YAML。后端 scanner 每 5 秒检测一次配置文件变化，大部分策略阈值无需重新发版即可生效。")
 
     config_dict = config.model_dump()
+    runtime = config_dict.setdefault("runtime", {"scanner_enabled": True})
     exchange = config_dict["exchange"]
     universe = config_dict["universe"]
     signal = config_dict["signal"]
@@ -121,6 +122,17 @@ def render_config_editor(config_path: str, config) -> None:
     exit_config = config_dict["exit"]
 
     with st.form("strategy_config_form"):
+        st.subheader("Program Control")
+        runtime["scanner_enabled"] = st.toggle(
+            "Scanner enabled",
+            value=bool(runtime.get("scanner_enabled", True)),
+            help="关闭后后端进程仍保持运行并继续热加载配置，但不会处理行情、触发信号或开纸面仓位。调参前建议先关闭，保存后再开启。",
+        )
+        if runtime["scanner_enabled"]:
+            st.success("Scanner is enabled. 保存后后端会继续扫描行情。")
+        else:
+            st.warning("Scanner is paused. 保存后后端会暂停扫描，适合安全调整参数。")
+
         st.subheader("Universe")
         c1, c2 = st.columns(2)
         universe["min_24h_quote_volume"] = c1.number_input(
@@ -156,15 +168,25 @@ def render_config_editor(config_path: str, config) -> None:
             step=1,
             help="计算价格涨跌幅的主窗口。当前策略建议 60 秒。",
         )
+        long_thresholds = signal.get("long_return_thresholds", {})
+        short_thresholds = signal.get("short_return_thresholds", {})
+        default_long_return = long_thresholds.get(
+            int(primary_window),
+            long_thresholds.get(str(int(primary_window)), 0.02),
+        )
+        default_short_return = short_thresholds.get(
+            int(primary_window),
+            short_thresholds.get(str(int(primary_window)), -0.02),
+        )
         long_return_pct = c2.number_input(
             "Long return threshold %",
-            value=float(signal["long_return_thresholds"][primary_window] * 100),
+            value=float(default_long_return * 100),
             step=0.1,
             help="窗口内涨幅达到该百分比，形成做多候选。",
         )
         short_return_pct = c3.number_input(
             "Short return threshold %",
-            value=float(signal["short_return_thresholds"][primary_window] * 100),
+            value=float(default_short_return * 100),
             step=0.1,
             help="窗口内跌幅达到该百分比或更低，形成做空候选。通常为负数。",
         )
@@ -361,6 +383,15 @@ def render_strategy_logic(config) -> None:
     risk = config.risk
     exit_config = config.exit
     execution = config.execution
+    primary_window = int(signal["primary_window_seconds"])
+    long_threshold = signal["long_return_thresholds"].get(
+        primary_window,
+        signal["long_return_thresholds"].get(str(primary_window), 0.02),
+    )
+    short_threshold = signal["short_return_thresholds"].get(
+        primary_window,
+        signal["short_return_thresholds"].get(str(primary_window), -0.02),
+    )
 
     st.header("Strategy Logic")
     st.markdown(
@@ -399,7 +430,7 @@ def render_strategy_logic(config) -> None:
         f"""
         1. WebSocket 接收 `!miniTicker@arr` 的全市场价格，用它快速维护短线价格窗口。
         2. 后端在本地维护 `{signal["windows_seconds"]}` 秒价格窗口，计算短线涨跌幅。
-        3. 60 秒涨幅 >= `{signal["long_return_thresholds"][60] * 100:.2f}%` 判定做多候选；60 秒跌幅 <= `{signal["short_return_thresholds"][60] * 100:.2f}%` 判定做空候选。
+        3. `{primary_window}` 秒涨幅 >= `{long_threshold * 100:.2f}%` 判定做多候选；`{primary_window}` 秒跌幅 <= `{short_threshold * 100:.2f}%` 判定做空候选。
         4. 候选出现后不立刻交易，等待当前 1m K 线收线，并额外等待 `{signal["kline_close_delay_ms"]}` ms 让交易所数据稳定。
         5. 收线后拉 REST `/fapi/v1/continuousKlines` 的 `{signal["kline_interval"]}` K 线。
         6. 做多要求这根 K 的 close 位于本根 K high-low 区间的 `{signal["long_close_position_min"] * 100:.0f}%` 以上。
@@ -418,11 +449,19 @@ def render_strategy_logic(config) -> None:
     st.subheader("Price Thresholds")
     threshold_rows = []
     for window in signal["windows_seconds"]:
+        long_value = signal["long_return_thresholds"].get(
+            window,
+            signal["long_return_thresholds"].get(str(window)),
+        )
+        short_value = signal["short_return_thresholds"].get(
+            window,
+            signal["short_return_thresholds"].get(str(window)),
+        )
         threshold_rows.append(
             {
                 "window_seconds": window,
-                "long_return_min_pct": signal["long_return_thresholds"][window] * 100,
-                "short_return_max_pct": signal["short_return_thresholds"][window] * 100,
+                "long_return_min_pct": None if long_value is None else long_value * 100,
+                "short_return_max_pct": None if short_value is None else short_value * 100,
             }
         )
     st.dataframe(pd.DataFrame(threshold_rows), width="stretch", hide_index=True)
@@ -564,6 +603,70 @@ def render_dashboard(
     st.subheader("Paper Positions")
     st.dataframe(
         positions[[column for column in position_columns if column in positions.columns]],
+        width="stretch",
+        hide_index=True,
+    )
+
+
+def render_signal_log(signal_checks: pd.DataFrame) -> None:
+    st.header("Log")
+    st.caption("这里记录价格先达到触发阈值后，后端等待 1m 收线并调用 K线/OI 接口捕捉到的数据。被成交量、OI、主动买卖比例或收盘位置过滤掉的候选也会保留。")
+
+    if signal_checks.empty:
+        st.info("No signal checks yet. Scanner needs a price move candidate before this table has data.")
+        return
+
+    signal_checks = format_time_column(signal_checks, "checked_at_ms")
+    signal_checks = format_time_column(signal_checks, "candidate_detected_at_ms")
+    signal_checks = format_time_column(signal_checks, "candle_close_time_ms")
+    signal_checks["passed"] = signal_checks["passed"].astype(bool)
+
+    passed_count = int(signal_checks["passed"].sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Checks", len(signal_checks))
+    c2.metric("Passed", passed_count)
+    c3.metric("Pass rate", f"{passed_count / len(signal_checks) * 100:.1f}%")
+    latest_reason = str(signal_checks.iloc[0]["reject_reason"] or "passed")
+    c4.metric("Latest result", latest_reason)
+
+    reason_counts = (
+        signal_checks.assign(result=signal_checks["reject_reason"].replace("", "passed"))
+        .groupby("result", as_index=False)
+        .size()
+        .sort_values("size", ascending=False)
+    )
+    st.subheader("Reject Reasons")
+    st.dataframe(reason_counts, width="stretch", hide_index=True)
+
+    log_columns = [
+        "checked_at",
+        "candidate_detected_at",
+        "candle_close_time",
+        "symbol",
+        "direction",
+        "passed",
+        "reject_reason",
+        "price_change_pct",
+        "window_seconds",
+        "candidate_trigger_price",
+        "trigger_price",
+        "quote_volume_usdt",
+        "average_quote_volume_usdt",
+        "volume_ratio",
+        "taker_buy_ratio",
+        "taker_sell_ratio",
+        "open_interest",
+        "previous_open_interest",
+        "open_interest_value_usdt",
+        "oi_delta_pct",
+        "oi_delta_value_usdt",
+        "oi_value_to_volume_ratio",
+        "close_position",
+        "score",
+    ]
+    st.subheader("Signal Checks")
+    st.dataframe(
+        signal_checks[[column for column in log_columns if column in signal_checks.columns]],
         width="stretch",
         hide_index=True,
     )
@@ -780,6 +883,15 @@ def main() -> None:
         LIMIT 500
         """,
     )
+    signal_checks = read_table(
+        str(database_path),
+        """
+        SELECT *
+        FROM signal_checks
+        ORDER BY checked_at_ms DESC
+        LIMIT 1000
+        """,
+    )
     positions = read_table(
         str(database_path),
         """
@@ -806,11 +918,14 @@ def main() -> None:
     )
     positions = add_unrealized_pnl(positions)
 
-    dashboard_tab, chart_tab, logic_tab, config_tab = st.tabs(
-        ["Monitor", "Position Chart", "Strategy Logic", "Config"]
+    dashboard_tab, log_tab, chart_tab, logic_tab, config_tab = st.tabs(
+        ["Monitor", "Log", "Position Chart", "Strategy Logic", "Config"]
     )
     with dashboard_tab:
         render_dashboard(heartbeat=heartbeat, signals=signals, positions=positions)
+
+    with log_tab:
+        render_signal_log(signal_checks)
 
     with chart_tab:
         render_position_chart(config, positions)

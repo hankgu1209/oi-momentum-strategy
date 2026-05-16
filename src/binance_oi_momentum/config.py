@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import shutil
@@ -17,9 +17,11 @@ class StrategyConfig:
     risk: dict[str, Any]
     exit: dict[str, Any]
     storage: dict[str, Any]
+    runtime: dict[str, Any] = field(default_factory=lambda: {"scanner_enabled": True})
 
     def model_dump(self) -> dict[str, Any]:
         return {
+            "runtime": self.runtime,
             "exchange": self.exchange,
             "universe": self.universe,
             "signal": self.signal,

@@ -1,3 +1,6 @@
+runtime:
+  scanner_enabled: true
+
 exchange:
   name: binance_usdm
   websocket_url: "wss://fstream.binance.com/market/stream?streams=!miniTicker@arr"
@@ -21,9 +24,9 @@ signal:
   windows_seconds: [60]
   primary_window_seconds: 60
   long_return_thresholds:
-    60: 0.03
+    60: 0.02
   short_return_thresholds:
-    60: -0.03
+    60: -0.02
   kline_interval: "1m"
   kline_lookback: 30
   kline_close_delay_ms: 1500
