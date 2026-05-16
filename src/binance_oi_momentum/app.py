@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from binance_oi_momentum.config import load_config
+from binance_oi_momentum.config import load_config, save_config
 from binance_oi_momentum.storage import SQLiteStorage, sqlite_path_from_url
 
 
@@ -106,6 +106,253 @@ def add_unrealized_pnl(positions: pd.DataFrame) -> pd.DataFrame:
     ).fillna(0.0)
     positions.loc[positions["status"] != "open", ["unrealized_pnl_pct", "unrealized_pnl_usdt"]] = 0.0
     return positions
+
+
+def render_config_editor(config_path: str, config) -> None:
+    st.header("Config")
+    st.caption("保存后会写入 YAML。后端 scanner 每 5 秒检测一次配置文件变化，大部分策略阈值无需重新发版即可生效。")
+
+    config_dict = config.model_dump()
+    exchange = config_dict["exchange"]
+    universe = config_dict["universe"]
+    signal = config_dict["signal"]
+    execution = config_dict["execution"]
+    risk = config_dict["risk"]
+    exit_config = config_dict["exit"]
+
+    with st.form("strategy_config_form"):
+        st.subheader("Universe")
+        c1, c2 = st.columns(2)
+        universe["min_24h_quote_volume"] = c1.number_input(
+            "Min 24h quote volume",
+            min_value=0,
+            value=int(universe["min_24h_quote_volume"]),
+            step=1_000_000,
+            help="只扫描 24h USDT 成交额不低于该值的合约，避免极端低流动性标的。",
+        )
+        universe["max_24h_quote_volume"] = c2.number_input(
+            "Max 24h quote volume",
+            min_value=0,
+            value=int(universe["max_24h_quote_volume"]),
+            step=10_000_000,
+            help="只扫描 24h USDT 成交额不高于该值的合约，用来聚焦小币和中低流动性标的。",
+        )
+        universe["exclude_symbols"] = [
+            item.strip().upper()
+            for item in st.text_area(
+                "Exclude symbols",
+                value="\n".join(universe.get("exclude_symbols") or []),
+                help="每行一个 symbol。这里的合约不会被扫描，比如 BTCUSDT、ETHUSDT。",
+            ).splitlines()
+            if item.strip()
+        ]
+
+        st.subheader("Price Trigger")
+        c1, c2, c3 = st.columns(3)
+        primary_window = c1.number_input(
+            "Primary window seconds",
+            min_value=1,
+            value=int(signal["primary_window_seconds"]),
+            step=1,
+            help="计算价格涨跌幅的主窗口。当前策略建议 60 秒。",
+        )
+        long_return_pct = c2.number_input(
+            "Long return threshold %",
+            value=float(signal["long_return_thresholds"][primary_window] * 100),
+            step=0.1,
+            help="窗口内涨幅达到该百分比，形成做多候选。",
+        )
+        short_return_pct = c3.number_input(
+            "Short return threshold %",
+            value=float(signal["short_return_thresholds"][primary_window] * 100),
+            step=0.1,
+            help="窗口内跌幅达到该百分比或更低，形成做空候选。通常为负数。",
+        )
+        signal["windows_seconds"] = [int(primary_window)]
+        signal["primary_window_seconds"] = int(primary_window)
+        signal["long_return_thresholds"] = {int(primary_window): float(long_return_pct) / 100}
+        signal["short_return_thresholds"] = {int(primary_window): float(short_return_pct) / 100}
+
+        st.subheader("Candle Confirmation")
+        c1, c2, c3 = st.columns(3)
+        signal["kline_lookback"] = c1.number_input(
+            "Kline lookback",
+            min_value=1,
+            value=int(signal["kline_lookback"]),
+            step=1,
+            help="计算平均成交量时使用过去多少根 1m K线。",
+        )
+        signal["kline_close_delay_ms"] = c2.number_input(
+            "Kline close delay ms",
+            min_value=0,
+            value=int(signal["kline_close_delay_ms"]),
+            step=100,
+            help="候选触发后等待当前 1m K 收线，再额外等待该毫秒数，避免交易所 K线数据尚未稳定。",
+        )
+        signal["volume_ratio_min"] = c3.number_input(
+            "Volume ratio min",
+            min_value=0.0,
+            value=float(signal["volume_ratio_min"]),
+            step=0.1,
+            help="最新 1m quote volume / 过去均量。大于该值才认为放量。",
+        )
+        c1, c2 = st.columns(2)
+        signal["long_close_position_min"] = c1.number_input(
+            "Long close position min",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(signal["long_close_position_min"]),
+            step=0.01,
+            help="做多时，1m 收盘价在本根 K high-low 区间中的位置，0.95 表示收在顶部 5%。",
+        )
+        signal["short_close_position_max"] = c2.number_input(
+            "Short close position max",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(signal["short_close_position_max"]),
+            step=0.01,
+            help="做空时，1m 收盘价在本根 K high-low 区间中的位置，0.05 表示收在底部 5%。",
+        )
+
+        st.subheader("Flow And OI")
+        c1, c2, c3 = st.columns(3)
+        signal["taker_buy_ratio_min_for_long"] = c1.number_input(
+            "Long taker buy ratio min",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(signal["taker_buy_ratio_min_for_long"]),
+            step=0.01,
+            help="做多时主动买入 quote volume 占比必须大于该值。",
+        )
+        signal["taker_sell_ratio_min_for_short"] = c2.number_input(
+            "Short taker sell ratio min",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(signal["taker_sell_ratio_min_for_short"]),
+            step=0.01,
+            help="做空时主动卖出 quote volume 占比必须大于该值。",
+        )
+        signal["oi_delta_pct_min"] = c3.number_input(
+            "OI delta pct min",
+            min_value=0.0,
+            value=float(signal["oi_delta_pct_min"]),
+            step=0.01,
+            help="新增 OI / 上一个 OI。0.05 表示 OI 至少增加 5%。",
+        )
+        c1, c2, c3 = st.columns(3)
+        signal["oi_value_to_volume_ratio_min"] = c1.number_input(
+            "OI value / volume min",
+            min_value=0.0,
+            value=float(signal["oi_value_to_volume_ratio_min"]),
+            step=0.01,
+            help="OI value 增量 / 最新 1m quote volume。越高说明新增仓位占成交额比例越大。",
+        )
+        signal["score_probe_min"] = c2.number_input(
+            "Score min",
+            min_value=0.0,
+            value=float(signal["score_probe_min"]),
+            step=1.0,
+            help="综合打分阈值。低于该分数不会记录为有效入场信号。",
+        )
+        signal["signal_cooldown_seconds"] = c3.number_input(
+            "Signal cooldown seconds",
+            min_value=0,
+            value=int(signal["signal_cooldown_seconds"]),
+            step=30,
+            help="同一 symbol 两次信号之间的最小冷却时间。",
+        )
+
+        st.subheader("Paper Trading And Risk")
+        c1, c2, c3 = st.columns(3)
+        execution["probe_position_fraction"] = c1.number_input(
+            "Probe position fraction",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(execution["probe_position_fraction"]),
+            step=0.01,
+            help="纸面开仓使用初始权益的比例。0.20 表示 20%。",
+        )
+        risk["initial_equity_usdt"] = c2.number_input(
+            "Initial equity USDT",
+            min_value=0.0,
+            value=float(risk["initial_equity_usdt"]),
+            step=100.0,
+            help="纸面交易初始权益，用于计算仓位名义金额和日亏损限制。",
+        )
+        risk["max_daily_loss"] = c3.number_input(
+            "Max daily loss",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(risk["max_daily_loss"]),
+            step=0.005,
+            help="每日最大已实现亏损比例。触发后新信号不再开仓。",
+        )
+        c1, c2 = st.columns(2)
+        risk["max_simultaneous_positions"] = c1.number_input(
+            "Max simultaneous positions",
+            min_value=0,
+            value=int(risk["max_simultaneous_positions"]),
+            step=1,
+            help="最多同时持有多少个纸面仓位。",
+        )
+        risk["max_same_direction_positions"] = c2.number_input(
+            "Max same direction positions",
+            min_value=0,
+            value=int(risk["max_same_direction_positions"]),
+            step=1,
+            help="最多同时持有多少个同方向仓位。",
+        )
+
+        st.subheader("Exit")
+        c1, c2, c3 = st.columns(3)
+        exit_config["stop_loss_pct"] = c1.number_input(
+            "Stop loss pct",
+            min_value=0.0,
+            value=float(exit_config["stop_loss_pct"]),
+            step=0.001,
+            format="%.4f",
+            help="固定止损百分比。0.012 表示 1.2%。",
+        )
+        exit_config["take_profit_pct"] = c2.number_input(
+            "Take profit pct",
+            min_value=0.0,
+            value=float(exit_config["take_profit_pct"]),
+            step=0.001,
+            format="%.4f",
+            help="固定止盈百分比。0.018 表示 1.8%，即止损 1.2% 时盈亏比 1:1.5。",
+        )
+        exit_config["max_hold_seconds"] = c3.number_input(
+            "Max hold seconds",
+            min_value=1,
+            value=int(exit_config["max_hold_seconds"]),
+            step=60,
+            help="超过该持仓秒数仍未止盈/止损，则按超时退出。",
+        )
+
+        st.subheader("Advanced")
+        c1, c2 = st.columns(2)
+        exchange["request_timeout_seconds"] = c1.number_input(
+            "REST timeout seconds",
+            min_value=1,
+            value=int(exchange["request_timeout_seconds"]),
+            step=1,
+            help="Binance REST 请求超时时间。网络较慢时可以调大。",
+        )
+        exchange["rest_retries"] = c2.number_input(
+            "REST retries",
+            min_value=1,
+            value=int(exchange["rest_retries"]),
+            step=1,
+            help="Binance REST 请求失败后的最大重试次数。",
+        )
+
+        submitted = st.form_submit_button("Save config", type="primary")
+
+    if submitted:
+        save_config(config_path, config_dict)
+        st.success(f"Saved {config_path}. Backend scanner will hot-reload shortly.")
+        st.cache_data.clear()
+        st.rerun()
 
 
 def render_strategy_logic(config) -> None:
@@ -559,7 +806,9 @@ def main() -> None:
     )
     positions = add_unrealized_pnl(positions)
 
-    dashboard_tab, chart_tab, logic_tab = st.tabs(["Monitor", "Position Chart", "Strategy Logic"])
+    dashboard_tab, chart_tab, logic_tab, config_tab = st.tabs(
+        ["Monitor", "Position Chart", "Strategy Logic", "Config"]
+    )
     with dashboard_tab:
         render_dashboard(heartbeat=heartbeat, signals=signals, positions=positions)
 
@@ -568,6 +817,9 @@ def main() -> None:
 
     with logic_tab:
         render_strategy_logic(config)
+
+    with config_tab:
+        render_config_editor(config_path, config)
 
     if auto_refresh:
         time.sleep(refresh_seconds)

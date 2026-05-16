@@ -4,8 +4,10 @@ import asyncio
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .binance import BinanceMarketClient
+from .config import load_config
 from .execution import PaperExecutionEngine
 from .models import Direction, MarketSnapshot, PriceTick, SignalContext
 from .risk import evaluate_probe_risk
@@ -52,6 +54,11 @@ class MarketScanner:
         )
         self.symbols: set[str] = set()
         self._last_heartbeat_ms = 0
+        self._last_config_check_ms = 0
+        self.config_path = Path(config["_config_path"]) if config.get("_config_path") else None
+        self.config_mtime: float | None = (
+            self.config_path.stat().st_mtime if self.config_path and self.config_path.exists() else None
+        )
 
     async def run(self) -> None:
         while not self.symbols:
@@ -67,6 +74,7 @@ class MarketScanner:
         print(f"scanner running, universe={len(self.symbols)}", flush=True)
 
         async for ticks in self.client.mini_ticker_stream():
+            await self._reload_config_if_changed()
             for tick in ticks:
                 if tick.symbol not in self.symbols:
                     continue
@@ -93,6 +101,40 @@ class MarketScanner:
             and item.get("quoteAsset") == universe_config["quote_asset"]
         }
         return symbols - exclude_symbols
+
+    async def _reload_config_if_changed(self) -> None:
+        if self.config_path is None:
+            return
+
+        now_ms = self._now_ms()
+        if now_ms - self._last_config_check_ms < 5_000:
+            return
+        self._last_config_check_ms = now_ms
+
+        try:
+            current_mtime = self.config_path.stat().st_mtime
+        except FileNotFoundError:
+            return
+
+        if self.config_mtime is not None and current_mtime <= self.config_mtime:
+            return
+
+        old_universe = self.config.get("universe", {}).copy()
+        new_config = load_config(self.config_path).model_dump()
+        new_config["_config_path"] = str(self.config_path)
+        self.config.clear()
+        self.config.update(new_config)
+        self.execution.risk_config = self.config["risk"]
+        self.execution.execution_config = self.config["execution"]
+        self.execution.exit_config = self.config["exit"]
+        self.config_mtime = current_mtime
+
+        if old_universe != self.config.get("universe", {}):
+            self.symbols = await self._load_universe()
+
+        message = f"config reloaded from {self.config_path}"
+        print(message, flush=True)
+        self.storage.record_heartbeat(now_ms, "running", message)
 
     async def _handle_tick(self, tick: PriceTick) -> None:
         state = self.states[tick.symbol]

@@ -37,7 +37,7 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - ./configs:/app/configs:ro
+      - ./configs:/app/configs
       - ./data:/app/data
     depends_on:
       - scanner

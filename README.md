@@ -120,6 +120,7 @@ The Docker setup runs two containers from the same image:
 - `oi-momentum-dashboard`: Streamlit frontend on port `8501`
 
 Both containers share `./data`, so `data/events.sqlite3` persists across restarts.
+The dashboard can edit `configs/strategy.example.yaml`; the scanner checks that file every few seconds and hot-reloads strategy/risk/exit settings without rebuilding the Docker image.
 
 ### Local Docker Run
 
@@ -143,6 +144,14 @@ docker compose logs -f dashboard
 docker compose restart scanner
 docker compose down
 ```
+
+After changing parameters in the dashboard `Config` tab, watch for a scanner log line like:
+
+```text
+config reloaded from configs/strategy.example.yaml
+```
+
+No image rebuild is needed for threshold changes. If you change exchange URLs, mounted paths, or code, restart/rebuild the containers.
 
 ### Tencent Cloud Deployment
 

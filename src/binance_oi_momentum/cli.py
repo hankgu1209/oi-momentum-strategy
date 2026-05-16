@@ -16,7 +16,9 @@ def run_scanner() -> None:
     )
     args = parser.parse_args()
     config = load_config(args.config)
-    asyncio.run(run_market_scanner(config.model_dump()))
+    config_dict = config.model_dump()
+    config_dict["_config_path"] = args.config
+    asyncio.run(run_market_scanner(config_dict))
 
 
 if __name__ == "__main__":

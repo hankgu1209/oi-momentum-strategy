@@ -13,7 +13,7 @@ universe:
     - "ETHUSDT"
     - "SOLUSDT"
     - "BNBUSDT"
-    
+
   min_24h_quote_volume: 10000000
   max_24h_quote_volume: 500000000
 
@@ -30,11 +30,11 @@ signal:
   long_close_position_min: 0.95
   short_close_position_max: 0.05
   volume_ratio_min: 2.0
-  oi_value_to_volume_ratio_min: 0.15
+  oi_value_to_volume_ratio_min: 0.1
   taker_buy_ratio_min_for_long: 0.60
   taker_sell_ratio_min_for_short: 0.60
   oi_sample_interval_seconds: 10
-  oi_delta_pct_min: 0.05
+  oi_delta_pct_min: 0.03
   signal_cooldown_seconds: 300
   score_probe_min: 70
   score_add_min: 85
