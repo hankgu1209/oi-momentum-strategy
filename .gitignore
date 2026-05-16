@@ -1,9 +1,39 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual env
 .env
 .venv/
 venv/
-.DS_Store
+ENV/
+
+# Jupyter
 .ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Logs
 logs/
 *.log
+
+# IDE
+.vscode/
+.idea/
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Data / output
+data/
+outputs/
+*.csv
+*.parquet
+*.db
+*.sqlite
