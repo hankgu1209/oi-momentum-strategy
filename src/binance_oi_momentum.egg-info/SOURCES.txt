@@ -6,6 +6,7 @@ src/binance_oi_momentum/binance.py
 src/binance_oi_momentum/cli.py
 src/binance_oi_momentum/config.py
 src/binance_oi_momentum/execution.py
+src/binance_oi_momentum/logging_utils.py
 src/binance_oi_momentum/models.py
 src/binance_oi_momentum/risk.py
 src/binance_oi_momentum/scanner.py

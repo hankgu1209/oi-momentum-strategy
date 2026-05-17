@@ -10,7 +10,7 @@ from typing import Any
 import aiohttp
 import websockets
 
-from .models import KlineVolumeContext, OIContext, PriceTick
+from .models import KlineClosed, KlineVolumeContext, OIContext, PriceTick
 
 
 logger = logging.getLogger(__name__)
@@ -136,6 +136,44 @@ class BinanceMarketClient:
                 logger.exception("websocket disconnected, reconnecting after delay")
                 await asyncio.sleep(5)
 
+    async def kline_stream(
+        self,
+        symbols: set[str],
+        *,
+        interval: str,
+    ) -> AsyncIterator[KlineClosed]:
+        streams = "/".join(
+            f"{symbol.lower()}@kline_{interval}"
+            for symbol in sorted(symbols)
+        )
+        url = f"{self._combined_stream_base_url()}/stream?streams={streams}"
+        while True:
+            try:
+                logger.info("connecting kline websocket symbols=%s interval=%s", len(symbols), interval)
+                async with websockets.connect(
+                    url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                ) as websocket:
+                    logger.info("kline websocket connected symbols=%s interval=%s", len(symbols), interval)
+                    async for raw_message in websocket:
+                        payload = json.loads(raw_message)
+                        data = payload.get("data", payload)
+                        kline = self._parse_kline_message(data, interval)
+                        if kline is not None:
+                            yield kline
+            except Exception:
+                logger.exception("kline websocket disconnected, reconnecting after delay")
+                await asyncio.sleep(5)
+
+    def _combined_stream_base_url(self) -> str:
+        if "/stream" in self.websocket_url:
+            return self.websocket_url.split("/stream", 1)[0]
+        if "/ws" in self.websocket_url:
+            return self.websocket_url.split("/ws", 1)[0]
+        return self.websocket_url.rstrip("/")
+
     async def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         last_error: Exception | None = None
         for attempt in range(1, self.rest_retries + 1):
@@ -171,6 +209,24 @@ class BinanceMarketClient:
                 low_24h=float(item["l"]),
                 base_volume_24h=float(item["v"]),
                 quote_volume_24h=float(item["q"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_kline_message(item: dict[str, Any], interval: str) -> KlineClosed | None:
+        try:
+            raw = item["k"]
+            return KlineClosed(
+                symbol=str(raw["s"]),
+                interval=str(raw.get("i", interval)),
+                open_time_ms=int(raw["t"]),
+                close_time_ms=int(raw["T"]),
+                open=float(raw["o"]),
+                high=float(raw["h"]),
+                low=float(raw["l"]),
+                close=float(raw["c"]),
+                is_closed=bool(raw["x"]),
             )
         except (KeyError, TypeError, ValueError):
             return None

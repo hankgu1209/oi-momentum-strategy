@@ -106,7 +106,10 @@ def add_unrealized_pnl(positions: pd.DataFrame) -> pd.DataFrame:
         positions.loc[short_mask, "entry_price"] - positions.loc[short_mask, "current_price"]
     ) / positions.loc[short_mask, "entry_price"]
     positions["unrealized_pnl_usdt"] = (
-        positions["notional_usdt"] * positions["unrealized_pnl_pct"]
+        positions.get("remaining_notional_usdt", positions["notional_usdt"]).fillna(
+            positions["notional_usdt"]
+        )
+        * positions["unrealized_pnl_pct"]
     ).fillna(0.0)
     positions.loc[positions["status"] != "open", ["unrealized_pnl_pct", "unrealized_pnl_usdt"]] = 0.0
     return positions
@@ -222,23 +225,33 @@ def render_config_editor(config_path: str, config) -> None:
             step=0.1,
             help="最新 1m quote volume / 过去均量。大于该值才认为放量。",
         )
+        long_close_distance_default = signal.get(
+            "long_close_distance_max",
+            max(1.0 - float(signal.get("long_close_position_min", 0.999)), 0.0),
+        )
+        short_close_distance_default = signal.get(
+            "short_close_distance_max",
+            float(signal.get("short_close_position_max", 0.001)),
+        )
         c1, c2 = st.columns(2)
-        signal["long_close_position_min"] = c1.number_input(
-            "Long close position min",
+        signal["long_close_distance_max"] = c1.number_input(
+            "Long close distance max",
             min_value=0.0,
-            max_value=1.0,
-            value=float(signal["long_close_position_min"]),
-            step=0.01,
-            help="做多时，1m 收盘价在本根 K high-low 区间中的位置，0.95 表示收在顶部 5%。",
+            value=float(long_close_distance_default),
+            step=0.0005,
+            format="%.4f",
+            help="做多时，(high - close) / high 必须不大于该值。0.001 表示 close 距离 high 不超过约 0.1%。",
         )
-        signal["short_close_position_max"] = c2.number_input(
-            "Short close position max",
+        signal["short_close_distance_max"] = c2.number_input(
+            "Short close distance max",
             min_value=0.0,
-            max_value=1.0,
-            value=float(signal["short_close_position_max"]),
-            step=0.01,
-            help="做空时，1m 收盘价在本根 K high-low 区间中的位置，0.05 表示收在底部 5%。",
+            value=float(short_close_distance_default),
+            step=0.0005,
+            format="%.4f",
+            help="做空时，(close - low) / low 必须不大于该值。0.001 表示 close 距离 low 不超过约 0.1%。",
         )
+        signal.pop("long_close_position_min", None)
+        signal.pop("short_close_position_max", None)
 
         st.subheader("Flow And OI")
         c1, c2, c3 = st.columns(3)
@@ -354,6 +367,37 @@ def render_config_editor(config_path: str, config) -> None:
             step=60,
             help="超过该持仓秒数仍未止盈/止损，则按超时退出。",
         )
+        c1, c2, c3 = st.columns(3)
+        exit_config["scale_out_enabled"] = c1.toggle(
+            "Scale out take profit",
+            value=bool(exit_config.get("scale_out_enabled", False)),
+            help="开启后触及 take profit 先平一部分仓位，剩余仓位进入 K线 pivot trailing stop。",
+        )
+        exit_config["first_take_profit_fraction"] = c2.number_input(
+            "TP1 close fraction",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(exit_config.get("first_take_profit_fraction", 0.5)),
+            step=0.05,
+            help="分批止盈开启时，TP1 平掉的仓位比例。0.5 表示先平一半。",
+        )
+        exit_config["trailing_pivot_window"] = c3.number_input(
+            "Trailing pivot window",
+            min_value=1,
+            value=int(exit_config.get("trailing_pivot_window", 5)),
+            step=1,
+            help="计算 trailing pivot 使用最近多少根已收线 K线。多单取 down pivot，空单取 up pivot。",
+        )
+        exit_config["trailing_kline_interval"] = st.selectbox(
+            "Trailing kline interval",
+            ["1m", "3m", "5m", "15m"],
+            index=["1m", "3m", "5m", "15m"].index(
+                str(exit_config.get("trailing_kline_interval", "1m"))
+                if str(exit_config.get("trailing_kline_interval", "1m")) in ["1m", "3m", "5m", "15m"]
+                else "1m"
+            ),
+            help="有持仓后订阅 Binance Kline websocket 的 interval。只有已收线 K线会进入 pivot 计算。",
+        )
 
         st.subheader("Advanced")
         c1, c2 = st.columns(2)
@@ -407,31 +451,69 @@ def render_strategy_logic(config) -> None:
         primary_window,
         signal["short_return_thresholds"].get(str(primary_window), -0.02),
     )
+    long_close_distance_max = signal.get(
+        "long_close_distance_max",
+        max(1.0 - float(signal.get("long_close_position_min", 0.999)), 0.0),
+    )
+    short_close_distance_max = signal.get(
+        "short_close_distance_max",
+        float(signal.get("short_close_position_max", 0.001)),
+    )
+    scale_out_enabled = bool(exit_config.get("scale_out_enabled", False))
+    first_take_profit_fraction = float(exit_config.get("first_take_profit_fraction", 0.5))
+    trailing_kline_interval = str(exit_config.get("trailing_kline_interval", "1m"))
+    trailing_pivot_window = int(exit_config.get("trailing_pivot_window", 5))
 
     st.header("Strategy Logic")
     st.markdown(
-        """
-        这个系统当前是研究和纸面交易模式，用来连续记录信号、模拟进出场，并观察信号触发后
-        是否真的存在短线延续性。它不会发送真实 Binance 下单请求。
-        """
+        "这个系统当前是研究和纸面交易模式，用来连续记录候选、有效信号和模拟仓位，验证低流动性合约短线顺势策略是否有延续性。系统不会发送真实 Binance 下单请求。"
     )
 
     st.subheader("Core Hypothesis")
     st.markdown(
         """
-        低流动性 USDT 永续小币在短时间内出现价格趋势波动时，如果同时伴随成交额放大、
-        open interest 增加，且 OI 增量相对成交额足够大，可能意味着新资金正在主动建立方向性仓位。
-        策略尝试跟随这类短线资金流：
+        策略关注 Binance USDT-M 永续里的中低流动性小币。假设是：当价格在短时间内快速单边波动，同时成交额放大、open interest 增加，并且主动买卖方向与价格方向一致时，可能有新资金正在主动建立方向性仓位。
 
         - 价格上涨 + OI 增加 + 放量：顺势做多
         - 价格下跌 + OI 增加 + 放量：顺势做空
+        - 触发后不立即入场，而是等待当前 K 线收线，用收线质量过滤假突破
         """
     )
 
-    st.subheader("Universe Filter")
+    st.subheader("Data Sources")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "用途": "全市场价格扫描",
+                    "接口": "`!miniTicker@arr` WebSocket",
+                    "说明": "维护本地短线价格窗口，更新最新价和 24h quote volume。",
+                },
+                {
+                    "用途": "候选后成交量确认",
+                    "接口": "`/fapi/v1/continuousKlines` REST",
+                    "说明": "候选触发后，等待当前 K 线收线，再获取最新收线 K 和历史均量。",
+                },
+                {
+                    "用途": "OI 确认",
+                    "接口": "`/futures/data/openInterestHist` REST",
+                    "说明": "比较最近两个 5m OI 快照，计算新增 OI / 上一个 OI。",
+                },
+                {
+                    "用途": "持仓 trailing",
+                    "接口": "`<symbol>@kline_<interval>` WebSocket",
+                    "说明": "仅在有分批止盈持仓时订阅，且只使用 `k.x=true` 的已收线 K。",
+                },
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.subheader("Universe")
     st.markdown(
         f"""
-        扫描标的来自 Binance USDT-M perpetual 合约，并按 24h quote volume 过滤低流动性区间：
+        扫描标的来自 Binance USDT-M perpetual 合约。若 `include_symbols` 为空，则从交易所合约列表里加载所有 `TRADING` 状态、quote asset 为 `{universe["quote_asset"]}` 的 perpetual 合约，再按 24h quote volume 做流动性过滤。
 
         - Quote asset: `{universe["quote_asset"]}`
         - 24h quote volume min: `{universe["min_24h_quote_volume"]:,.0f}` USDT
@@ -443,25 +525,19 @@ def render_strategy_logic(config) -> None:
     st.subheader("Signal Pipeline")
     st.markdown(
         f"""
-        1. WebSocket 接收 `!miniTicker@arr` 的全市场价格，用它快速维护短线价格窗口。
-        2. 后端在本地维护 `{signal["windows_seconds"]}` 秒价格窗口，计算短线涨跌幅。
-        3. `{primary_window}` 秒涨幅 >= `{long_threshold * 100:.2f}%` 判定做多候选；`{primary_window}` 秒跌幅 <= `{short_threshold * 100:.2f}%` 判定做空候选。
-        4. 候选出现后不立刻交易，等待当前 1m K 线收线，并额外等待 `{signal["kline_close_delay_ms"]}` ms 让交易所数据稳定。
-        5. 收线后拉 REST `/fapi/v1/continuousKlines` 的 `{signal["kline_interval"]}` K 线。
-        6. 做多要求这根 K 的 close 位于本根 K high-low 区间的 `{signal["long_close_position_min"] * 100:.0f}%` 以上。
-        7. 做空要求这根 K 的 close 位于本根 K high-low 区间的 `{signal["short_close_position_max"] * 100:.0f}%` 以下。
-        8. 最新 K 线 quote volume / 过去 `{signal["kline_lookback"]}` 根平均 quote volume 必须 >= `{signal["volume_ratio_min"]}`。
-        9. 触发候选后再拉 REST `/futures/data/openInterestHist`，比较最近两个 5m OI 点。
-        10. 新增 OI / 上一个 OI 必须 >= `{signal["oi_delta_pct_min"]:.4f}`。
-        11. `OI value delta / recent quote volume` 必须 >= `{signal["oi_value_to_volume_ratio_min"]}`。
-        12. 做多时 taker buy quote volume ratio 必须 >= `{signal["taker_buy_ratio_min_for_long"]}`。
-        13. 做空时 taker sell quote volume ratio 必须 >= `{signal["taker_sell_ratio_min_for_short"]}`。
-        14. 综合 volume、OI、主动买卖比例，score 必须 >= `{signal["score_probe_min"]}`。
-        15. 通过风控后，记录信号并开启纸面仓位，入场价使用已收线 1m K 的 close。
+        1. 接收 `!miniTicker@arr` 全市场 tick，并为每个 symbol 维护 `{signal["windows_seconds"]}` 秒价格窗口。
+        2. 对每个窗口计算 `price_return = (current_price - window_base_price) / window_base_price`。
+        3. `{primary_window}` 秒涨幅 `>= {long_threshold * 100:.2f}%` 形成做多候选。
+        4. `{primary_window}` 秒跌幅 `<= {short_threshold * 100:.2f}%` 形成做空候选。
+        5. 候选不会立刻交易，而是等待当前 `{signal["kline_interval"]}` K 线收线，并额外等待 `{signal["kline_close_delay_ms"]}` ms。
+        6. 收线后拉 `/fapi/v1/continuousKlines`，获取最新已收线 K 和前 `{signal["kline_lookback"]}` 根 K 的平均成交额。
+        7. 再拉 `/futures/data/openInterestHist`，比较最近两个 5m OI 快照。
+        8. 通过方向、成交额、OI、主动买卖比例和分数过滤后，记录有效 signal。
+        9. 通过风控后开启纸面仓位，入场价使用已收线 K 的 close。
         """
     )
 
-    st.subheader("Price Thresholds")
+    st.subheader("Price Trigger")
     threshold_rows = []
     for window in signal["windows_seconds"]:
         long_value = signal["long_return_thresholds"].get(
@@ -481,26 +557,132 @@ def render_strategy_logic(config) -> None:
         )
     st.dataframe(pd.DataFrame(threshold_rows), width="stretch", hide_index=True)
 
-    st.subheader("Paper Trading Exits")
+    st.subheader("Candle Confirmation")
     st.markdown(
         f"""
-        当前只做固定规则的纸面交易，用于验证信号质量：
+        候选触发后，最新收线 K 需要证明趋势没有明显回落。这里不用 high-low 区间百分位，而是计算 close 距离方向极值的比例。
 
-        - Probe position fraction: `{execution["probe_position_fraction"]:.2f}` of initial equity
-        - Initial equity: `{risk["initial_equity_usdt"]:,.0f}` USDT
-        - Stop loss: `{exit_config["stop_loss_pct"] * 100:.2f}%`
-        - Take profit: `{exit_config["take_profit_pct"] * 100:.2f}%`
-        - Max hold: `{exit_config["max_hold_seconds"]}` seconds
-        - Max simultaneous positions: `{risk["max_simultaneous_positions"]}`
-        - Max same direction positions: `{risk["max_same_direction_positions"]}`
-        - Max daily loss: `{risk["max_daily_loss"] * 100:.2f}%`
+        - 做多 close 强度：`(high - close) / high <= {long_close_distance_max * 100:.3f}%`
+        - 做空 close 强度：`(close - low) / low <= {short_close_distance_max * 100:.3f}%`
+        - 成交额放大：`latest_quote_volume / average_quote_volume >= {signal["volume_ratio_min"]:.2f}`
+        - 均量窗口：过去 `{signal["kline_lookback"]}` 根已收线 `{signal["kline_interval"]}` K
         """
     )
 
-    st.subheader("Recorded Data")
+    st.subheader("OI And Flow Filters")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "过滤项": "OI delta pct",
+                    "定义": "`(current_oi - previous_oi) / previous_oi`",
+                    "当前阈值": f">= {signal['oi_delta_pct_min'] * 100:.2f}%",
+                },
+                {
+                    "过滤项": "OI value / volume",
+                    "定义": "`max(oi_delta_value, 0) / latest_quote_volume`",
+                    "当前阈值": f">= {signal['oi_value_to_volume_ratio_min']:.2f}",
+                },
+                {
+                    "过滤项": "Long taker buy ratio",
+                    "定义": "`taker_buy_quote_volume / quote_volume`",
+                    "当前阈值": f">= {signal['taker_buy_ratio_min_for_long']:.2f}",
+                },
+                {
+                    "过滤项": "Short taker sell ratio",
+                    "定义": "`1 - taker_buy_ratio`",
+                    "当前阈值": f">= {signal['taker_sell_ratio_min_for_short']:.2f}",
+                },
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.subheader("Score")
+    st.markdown(
+        f"""
+        Score 是一个用于过滤候选质量的加权分数，当前有效信号要求 `score >= {signal["score_probe_min"]:.0f}`。
+
+        - Volume contribution: `min(volume_ratio / 2, 3) * 15`
+        - OI delta contribution: `min(max(oi_delta_pct, 0) / 0.05, 3) * 15`
+        - OI value / volume contribution: `min(max(oi_value_to_volume_ratio, 0) / 0.25, 3) * 10`
+        - Long flow contribution: `max(taker_buy_ratio - 0.5, 0) * 120`
+        - Short flow contribution: `max(taker_sell_ratio - 0.5, 0) * 120`
+        - 若将来接入 spread/slippage，会按配置扣分
+        """
+    )
+
+    st.subheader("Risk Gate")
+    st.markdown(
+        f"""
+        风控只决定是否开启纸面仓位；即使风控拒绝，有效 signal 仍会被记录，方便复盘。
+
+        - Initial equity: `{risk["initial_equity_usdt"]:,.0f}` USDT
+        - Probe position fraction: `{execution["probe_position_fraction"]:.2f}`
+        - Max simultaneous positions: `{risk["max_simultaneous_positions"]}`
+        - Max same direction positions: `{risk["max_same_direction_positions"]}`
+        - Max daily loss: `{risk["max_daily_loss"] * 100:.2f}%`
+        - Max spread pct: `{risk["max_spread_pct"] * 100:.3f}%`
+        - Max estimated slippage pct: `{risk["max_estimated_slippage_pct"] * 100:.3f}%`
+        """
+    )
+
+    st.subheader("Position And Exit")
+    st.markdown(
+        f"""
+        纸面仓位按入场价和初始权益计算名义金额，不发送真实订单。固定止损始终有效。
+
+        - Entry price: 有效 signal 的收线 K close
+        - Notional: `initial_equity * probe_position_fraction`
+        - Stop loss: `{exit_config["stop_loss_pct"] * 100:.2f}%`
+        - Take profit target: `{exit_config["take_profit_pct"] * 100:.2f}%`
+        - Max hold: `{exit_config["max_hold_seconds"]}` seconds
+        - Scale out enabled: `{exit_config.get("scale_out_enabled", False)}`
+        - TP1 close fraction: `{exit_config.get("first_take_profit_fraction", 0.5):.2f}`
+        """
+    )
+
+    st.subheader("Scale Out And Trailing Pivot")
+    st.markdown(
+        f"""
+        分批止盈开启时，仓位到达 take profit target 后不会一次性全平。
+
+        1. TP1 触发：先平 `{first_take_profit_fraction * 100:.0f}%` 仓位，并记录 `take_profit_1_*` 字段。
+        2. 剩余仓位进入 trailing 状态，`trailing_active = true`。
+        3. 后端启动 Binance Kline WebSocket，仅订阅当前持仓 symbol 的 `<symbol>@kline_{trailing_kline_interval}`。
+        4. 只有 `k.x=true` 的已收线 K 会参与 pivot 计算。
+        5. 多单 trailing stop 使用前 `{trailing_pivot_window}` 根已收线 K 的 down pivot，也就是最低 low。
+        6. 空单 trailing stop 使用前 `{trailing_pivot_window}` 根已收线 K 的 up pivot，也就是最高 high。
+        7. 多单如果 close 跌破 down pivot，按 `trailing_pivot` 平剩余仓位。
+        8. 空单如果 close 涨破 up pivot，按 `trailing_pivot` 平剩余仓位。
+        """
+    )
+
+    st.subheader("Logs And Reject Reasons")
     st.markdown(
         """
-        每次信号会写入 SQLite，核心字段包括：
+        Log tab 展示 `signal_checks` 表，也就是价格先触发候选后，系统实际拉到的 K线/OI 数据。即使候选被过滤，也会留下原因。
+
+        常见 reject reason：
+
+        - `missing_kline_data`: K线数据不足或请求为空
+        - `missing_open_interest_data`: OI 数据为空
+        - `long_close_too_far_from_high`: 做多收盘价离 high 太远
+        - `short_close_too_far_from_low`: 做空收盘价离 low 太远
+        - `volume_ratio_below_min`: 成交额放大倍数不足
+        - `oi_delta_pct_below_min`: OI 增幅不足
+        - `oi_value_to_volume_below_min`: OI value 增量相对成交额不足
+        - `taker_buy_ratio_below_min`: 做多主动买入占比不足
+        - `taker_sell_ratio_below_min`: 做空主动卖出占比不足
+        - `score_below_min`: 综合分数不足
+        """
+    )
+
+    st.subheader("Recorded Fields")
+    st.markdown(
+        """
+        SQLite 会保存候选检查、有效信号和纸面仓位。核心字段包括：
 
         - `price_change_pct`: 触发窗口内价格涨跌幅
         - `quote_volume_usdt`: 最新 1m K 线 quote volume
@@ -514,6 +696,9 @@ def render_strategy_logic(config) -> None:
         - `oi_value_to_volume_ratio`: OI value 增量 / 最近窗口成交额
         - `score`: 综合打分
         - `risk_allowed` / `risk_reason`: 是否通过风控以及原因
+        - `take_profit_1_price` / `take_profit_1_pnl_usdt`: TP1 价格和已实现收益
+        - `trailing_active` / `trailing_stop_price`: 是否进入 trailing 和当前 pivot 止损
+        - `remaining_quantity` / `remaining_notional_usdt`: 剩余仓位规模
         """
     )
 
@@ -560,6 +745,7 @@ def render_dashboard(
     signals = format_time_column(signals, "created_at_ms")
     positions = format_time_column(positions, "entry_time_ms")
     positions = format_time_column(positions, "exit_time_ms")
+    positions = format_time_column(positions, "take_profit_1_time_ms")
 
     signal_columns = [
         "created_at",
@@ -592,10 +778,22 @@ def render_dashboard(
         "exit_price",
         "stop_loss_price",
         "take_profit_price",
+        "take_profit_1_price",
+        "take_profit_2_price",
+        "scale_out_enabled",
+        "trailing_active",
+        "trailing_stop_price",
+        "trailing_pivot_window",
         "current_price",
         "notional_usdt",
+        "remaining_notional_usdt",
+        "remaining_quantity",
         "unrealized_pnl_usdt",
         "unrealized_pnl_pct",
+        "take_profit_1_time",
+        "take_profit_1_exit_price",
+        "take_profit_1_quantity",
+        "take_profit_1_pnl_usdt",
         "signal_price_change_pct",
         "signal_open_interest",
         "signal_oi_delta_pct",
@@ -705,7 +903,7 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Entry", f"{position['entry_price']:g}")
     c2.metric("Stop", f"{position['stop_loss_price']:g}")
-    c3.metric("Take Profit", f"{position['take_profit_price']:g}")
+    c3.metric("TP1", f"{position.get('take_profit_1_price', position['take_profit_price']):g}")
     c4.metric("Unrealized", f"{position.get('unrealized_pnl_usdt', 0):.2f} USDT")
 
     try:
@@ -771,16 +969,19 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
             tooltip=candle_tooltip,
         )
     )
-    levels = pd.DataFrame(
-        [
-            {"level": "Entry", "price": position["entry_price"]},
-            {"level": "Stop Loss", "price": position["stop_loss_price"]},
-            {"level": "Take Profit", "price": position["take_profit_price"]},
-        ]
-    )
+    level_rows = [
+        {"level": "Entry", "price": position["entry_price"]},
+        {"level": "Stop Loss", "price": position["stop_loss_price"]},
+        {"level": "Take Profit 1", "price": position.get("take_profit_1_price") or position["take_profit_price"]},
+    ]
+    if pd.notna(position.get("take_profit_2_price")):
+        level_rows.append({"level": "Take Profit 2", "price": position["take_profit_2_price"]})
+    if pd.notna(position.get("trailing_stop_price")):
+        level_rows.append({"level": "Trailing Stop", "price": position["trailing_stop_price"]})
+    levels = pd.DataFrame(level_rows)
     level_color = alt.Scale(
-        domain=["Entry", "Stop Loss", "Take Profit"],
-        range=["#2563eb", "#dc2626", "#16a34a"],
+        domain=["Entry", "Stop Loss", "Take Profit 1", "Take Profit 2", "Trailing Stop"],
+        range=["#2563eb", "#dc2626", "#16a34a", "#059669", "#9333ea"],
     )
     level_rules = (
         alt.Chart(levels)
@@ -817,9 +1018,24 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
                 "price": position["exit_price"],
             }
         )
+    if pd.notna(position.get("take_profit_1_time_ms")) and pd.notna(position.get("take_profit_1_exit_price")):
+        point_rows.append(
+            {
+                "event": "Take Profit 1",
+                "time": pd.to_datetime(position["take_profit_1_time_ms"], unit="ms"),
+                "price": position["take_profit_1_exit_price"],
+            }
+        )
     points = pd.DataFrame(point_rows)
-    event_color = alt.Scale(domain=["Entry", "Exit"], range=["#2563eb", "#f97316"])
-    points["event_type"] = points["event"].apply(lambda value: "Exit" if value.startswith("Exit") else "Entry")
+    event_color = alt.Scale(
+        domain=["Entry", "Exit", "Take Profit"],
+        range=["#2563eb", "#f97316", "#16a34a"],
+    )
+    points["event_type"] = points["event"].apply(
+        lambda value: "Exit"
+        if value.startswith("Exit")
+        else ("Take Profit" if value.startswith("Take Profit") else "Entry")
+    )
     event_points = (
         alt.Chart(points)
         .mark_point(filled=True, size=110)

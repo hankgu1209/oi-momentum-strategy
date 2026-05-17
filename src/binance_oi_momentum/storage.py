@@ -79,6 +79,20 @@ class SQLiteStorage:
                     notional_usdt REAL NOT NULL,
                     stop_loss_price REAL NOT NULL,
                     take_profit_price REAL NOT NULL,
+                    initial_quantity REAL,
+                    remaining_quantity REAL,
+                    remaining_notional_usdt REAL,
+                    scale_out_enabled INTEGER NOT NULL DEFAULT 0,
+                    trailing_active INTEGER NOT NULL DEFAULT 0,
+                    take_profit_1_price REAL,
+                    take_profit_2_price REAL,
+                    take_profit_1_time_ms INTEGER,
+                    take_profit_1_exit_price REAL,
+                    take_profit_1_quantity REAL,
+                    take_profit_1_pnl_usdt REAL,
+                    take_profit_1_pnl_pct REAL,
+                    trailing_stop_price REAL,
+                    trailing_pivot_window INTEGER,
                     max_hold_seconds INTEGER NOT NULL,
                     exit_time_ms INTEGER,
                     exit_price REAL,
@@ -145,6 +159,30 @@ class SQLiteStorage:
             self._ensure_column(conn, "signals", "taker_sell_ratio", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(conn, "signals", "open_interest", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(conn, "signals", "open_interest_value_usdt", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "paper_positions", "initial_quantity", "REAL")
+            self._ensure_column(conn, "paper_positions", "remaining_quantity", "REAL")
+            self._ensure_column(conn, "paper_positions", "remaining_notional_usdt", "REAL")
+            self._ensure_column(conn, "paper_positions", "scale_out_enabled", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "paper_positions", "trailing_active", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "paper_positions", "take_profit_1_price", "REAL")
+            self._ensure_column(conn, "paper_positions", "take_profit_2_price", "REAL")
+            self._ensure_column(conn, "paper_positions", "take_profit_1_time_ms", "INTEGER")
+            self._ensure_column(conn, "paper_positions", "take_profit_1_exit_price", "REAL")
+            self._ensure_column(conn, "paper_positions", "take_profit_1_quantity", "REAL")
+            self._ensure_column(conn, "paper_positions", "take_profit_1_pnl_usdt", "REAL")
+            self._ensure_column(conn, "paper_positions", "take_profit_1_pnl_pct", "REAL")
+            self._ensure_column(conn, "paper_positions", "trailing_stop_price", "REAL")
+            self._ensure_column(conn, "paper_positions", "trailing_pivot_window", "INTEGER")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET
+                    initial_quantity = COALESCE(initial_quantity, quantity),
+                    remaining_quantity = COALESCE(remaining_quantity, quantity),
+                    remaining_notional_usdt = COALESCE(remaining_notional_usdt, notional_usdt),
+                    take_profit_1_price = COALESCE(take_profit_1_price, take_profit_price)
+                """
+            )
             self._ensure_position_journal_view(conn)
 
     def record_signal_check(self, log: dict[str, Any]) -> int:
@@ -305,9 +343,11 @@ class SQLiteStorage:
                 INSERT INTO paper_positions(
                     signal_id, symbol, direction, status, entry_time_ms, entry_price,
                     quantity, notional_usdt, stop_loss_price, take_profit_price,
-                    max_hold_seconds
+                    initial_quantity, remaining_quantity, remaining_notional_usdt,
+                    scale_out_enabled, trailing_active, take_profit_1_price,
+                    take_profit_2_price, trailing_pivot_window, max_hold_seconds
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     position.signal_id,
@@ -320,10 +360,72 @@ class SQLiteStorage:
                     position.notional_usdt,
                     position.stop_loss_price,
                     position.take_profit_price,
+                    position.initial_quantity,
+                    position.remaining_quantity,
+                    position.remaining_notional_usdt,
+                    int(position.scale_out_enabled),
+                    int(position.trailing_active),
+                    position.take_profit_1_price,
+                    position.take_profit_2_price,
+                    position.trailing_pivot_window,
                     position.max_hold_seconds,
                 ),
             )
             return int(cursor.lastrowid)
+
+    def mark_first_take_profit(
+        self,
+        position_id: int,
+        *,
+        timestamp_ms: int,
+        exit_price: float,
+        exit_quantity: float,
+        remaining_quantity: float,
+        remaining_notional_usdt: float,
+        pnl_usdt: float,
+        pnl_pct: float,
+        trailing_stop_price: float | None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET
+                    trailing_active = 1,
+                    take_profit_1_time_ms = ?,
+                    take_profit_1_exit_price = ?,
+                    take_profit_1_quantity = ?,
+                    take_profit_1_pnl_usdt = ?,
+                    take_profit_1_pnl_pct = ?,
+                    remaining_quantity = ?,
+                    remaining_notional_usdt = ?,
+                    trailing_stop_price = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    timestamp_ms,
+                    exit_price,
+                    exit_quantity,
+                    pnl_usdt,
+                    pnl_pct,
+                    remaining_quantity,
+                    remaining_notional_usdt,
+                    trailing_stop_price,
+                    position_id,
+                    PositionStatus.OPEN.value,
+                ),
+            )
+
+    def update_trailing_stop(self, position_id: int, trailing_stop_price: float) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET trailing_stop_price = ?
+                WHERE id = ? AND status = ?
+                """,
+                (trailing_stop_price, position_id, PositionStatus.OPEN.value),
+            )
 
     def close_position(
         self,
@@ -340,7 +442,9 @@ class SQLiteStorage:
                 """
                 UPDATE paper_positions
                 SET status = ?, exit_time_ms = ?, exit_price = ?, exit_reason = ?,
-                    pnl_usdt = ?, pnl_pct = ?
+                    pnl_usdt = ?, pnl_pct = ?,
+                    remaining_quantity = 0,
+                    remaining_notional_usdt = 0
                 WHERE id = ? AND status = ?
                 """,
                 (
@@ -428,8 +532,22 @@ class SQLiteStorage:
                 p.entry_price,
                 p.stop_loss_price,
                 p.take_profit_price,
+                p.take_profit_1_price,
+                p.take_profit_2_price,
+                p.take_profit_1_time_ms,
+                p.take_profit_1_exit_price,
+                p.take_profit_1_quantity,
+                p.take_profit_1_pnl_usdt,
+                p.take_profit_1_pnl_pct,
+                p.trailing_stop_price,
+                p.scale_out_enabled,
+                p.trailing_active,
+                p.trailing_pivot_window,
                 p.notional_usdt,
                 p.quantity,
+                p.initial_quantity,
+                p.remaining_quantity,
+                p.remaining_notional_usdt,
                 p.exit_time_ms,
                 p.exit_price,
                 p.exit_reason,
@@ -469,6 +587,22 @@ class SQLiteStorage:
             stop_loss_price=float(row["stop_loss_price"]),
             take_profit_price=float(row["take_profit_price"]),
             max_hold_seconds=int(row["max_hold_seconds"]),
+            initial_quantity=float(row["initial_quantity"]) if row["initial_quantity"] is not None else float(row["quantity"]),
+            remaining_quantity=float(row["remaining_quantity"]) if row["remaining_quantity"] is not None else float(row["quantity"]),
+            remaining_notional_usdt=float(row["remaining_notional_usdt"])
+            if row["remaining_notional_usdt"] is not None
+            else float(row["notional_usdt"]),
+            scale_out_enabled=bool(row["scale_out_enabled"]),
+            trailing_active=bool(row["trailing_active"]),
+            take_profit_1_price=row["take_profit_1_price"],
+            take_profit_2_price=row["take_profit_2_price"],
+            take_profit_1_time_ms=row["take_profit_1_time_ms"],
+            take_profit_1_exit_price=row["take_profit_1_exit_price"],
+            take_profit_1_quantity=row["take_profit_1_quantity"],
+            take_profit_1_pnl_usdt=row["take_profit_1_pnl_usdt"],
+            take_profit_1_pnl_pct=row["take_profit_1_pnl_pct"],
+            trailing_stop_price=row["trailing_stop_price"],
+            trailing_pivot_window=row["trailing_pivot_window"],
             exit_time_ms=row["exit_time_ms"],
             exit_price=row["exit_price"],
             exit_reason=row["exit_reason"],

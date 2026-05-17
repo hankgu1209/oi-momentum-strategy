@@ -1,10 +1,13 @@
 services:
   scanner:
-    build: .
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
     image: oi-momentum:latest
     container_name: oi-momentum-scanner
     restart: unless-stopped
-    command: ["oi-momentum-scan", "--config", "configs/strategy.example.yaml"]
+    command: ["python", "-m", "binance_oi_momentum.cli", "--config", "configs/strategy.example.yaml"]
     environment:
       TZ: Asia/Shanghai
       LOG_LEVEL: INFO
@@ -16,7 +19,10 @@ services:
       - ./data:/app/data
 
   dashboard:
-    build: .
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
     image: oi-momentum:latest
     container_name: oi-momentum-dashboard
     restart: unless-stopped
@@ -55,8 +61,8 @@ services:
       DASHBOARD_USER: ${DASHBOARD_USER:-admin}
       DASHBOARD_PASSWORD_HASH: ${DASHBOARD_PASSWORD_HASH:-not-configured}
     ports:
-      - "80:80"
-      - "443:443"
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

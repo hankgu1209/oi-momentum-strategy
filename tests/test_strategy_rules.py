@@ -1,4 +1,7 @@
+import pytest
+
 from binance_oi_momentum.models import Direction, MarketSnapshot
+from binance_oi_momentum.scanner import MarketScanner
 from binance_oi_momentum.strategy import infer_candidate_direction, score_signal
 
 
@@ -32,3 +35,20 @@ def test_score_penalizes_wide_spread() -> None:
 
     assert wide_spread_score < clean_score
 
+
+def test_close_position_uses_directional_extreme_distance() -> None:
+    long_distance = MarketScanner._close_position(
+        low=100,
+        high=110,
+        close=109.9,
+        direction=Direction.LONG,
+    )
+    short_distance = MarketScanner._close_position(
+        low=100,
+        high=110,
+        close=100.1,
+        direction=Direction.SHORT,
+    )
+
+    assert long_distance == pytest.approx((110 - 109.9) / 110)
+    assert short_distance == pytest.approx((100.1 - 100) / 100)

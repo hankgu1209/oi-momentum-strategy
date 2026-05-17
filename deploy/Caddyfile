@@ -6,7 +6,7 @@
 
     encode zstd gzip
 
-    basicauth {
+    basic_auth {
         {$DASHBOARD_USER} {$DASHBOARD_PASSWORD_HASH}
     }
 

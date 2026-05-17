@@ -30,8 +30,8 @@ signal:
   kline_interval: "1m"
   kline_lookback: 30
   kline_close_delay_ms: 1500
-  long_close_position_min: 0.95
-  short_close_position_max: 0.05
+  long_close_distance_max: 0.001
+  short_close_distance_max: 0.001
   volume_ratio_min: 2.0
   oi_value_to_volume_ratio_min: 0.1
   taker_buy_ratio_min_for_long: 0.60
@@ -68,11 +68,14 @@ risk:
 exit:
   stop_loss_pct: 0.012
   take_profit_pct: 0.018
-  max_hold_seconds: 900
+  scale_out_enabled: true
+  first_take_profit_fraction: 0.50
+  trailing_kline_interval: "1m"
+  trailing_pivot_window: 5
+  max_hold_seconds: 900000
   failure_exit_seconds: 60
   failure_reversal_pct: 0.006
   first_take_profit_r: 0.8
-  first_take_profit_fraction: 0.40
   second_take_profit_r: 1.8
   second_take_profit_fraction: 0.30
   trailing_window_seconds: 30

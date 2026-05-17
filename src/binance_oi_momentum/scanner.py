@@ -93,27 +93,31 @@ class MarketScanner:
             self._scanner_enabled(),
         )
 
-        async for ticks in self.client.mini_ticker_stream():
-            await self._reload_config_if_changed()
-            if not self._scanner_enabled():
-                self.states.clear()
+        kline_manager = asyncio.create_task(self._run_position_kline_manager())
+        try:
+            async for ticks in self.client.mini_ticker_stream():
+                await self._reload_config_if_changed()
+                if not self._scanner_enabled():
+                    self.states.clear()
+                    now_ms = self._now_ms()
+                    if now_ms - self._last_heartbeat_ms > 10_000:
+                        self._last_heartbeat_ms = now_ms
+                        self.storage.record_heartbeat(now_ms, "paused", "scanner_enabled=false")
+                        logger.info("scanner paused scanner_enabled=false")
+                    continue
+
+                for tick in ticks:
+                    if tick.symbol not in self.symbols:
+                        continue
+                    await self._handle_tick(tick)
+
                 now_ms = self._now_ms()
                 if now_ms - self._last_heartbeat_ms > 10_000:
                     self._last_heartbeat_ms = now_ms
-                    self.storage.record_heartbeat(now_ms, "paused", "scanner_enabled=false")
-                    logger.info("scanner paused scanner_enabled=false")
-                continue
-
-            for tick in ticks:
-                if tick.symbol not in self.symbols:
-                    continue
-                await self._handle_tick(tick)
-
-            now_ms = self._now_ms()
-            if now_ms - self._last_heartbeat_ms > 10_000:
-                self._last_heartbeat_ms = now_ms
-                self.storage.record_heartbeat(now_ms, "running", f"universe={len(self.symbols)}")
-                logger.info("heartbeat running universe=%s ticks=%s", len(self.symbols), len(ticks))
+                    self.storage.record_heartbeat(now_ms, "running", f"universe={len(self.symbols)}")
+                    logger.info("heartbeat running universe=%s ticks=%s", len(self.symbols), len(ticks))
+        finally:
+            kline_manager.cancel()
 
     async def _load_universe(self) -> set[str]:
         universe_config = self.config["universe"]
@@ -170,6 +174,54 @@ class MarketScanner:
 
     def _scanner_enabled(self) -> bool:
         return bool(self.config.get("runtime", {}).get("scanner_enabled", True))
+
+    async def _run_position_kline_manager(self) -> None:
+        active_key: tuple[tuple[str, ...], str] | None = None
+        stream_task: asyncio.Task | None = None
+        while True:
+            if not self._scanner_enabled():
+                if stream_task is not None:
+                    stream_task.cancel()
+                    stream_task = None
+                    active_key = None
+                await asyncio.sleep(5)
+                continue
+
+            interval = str(self.config["exit"].get("trailing_kline_interval", "1m"))
+            symbols = tuple(
+                sorted(
+                    {
+                        position.symbol
+                        for position in self.storage.get_open_positions()
+                        if position.scale_out_enabled
+                    }
+                )
+            )
+            next_key = (symbols, interval) if symbols else None
+            if next_key != active_key:
+                if stream_task is not None:
+                    stream_task.cancel()
+                    stream_task = None
+                active_key = next_key
+                if next_key is not None:
+                    logger.info(
+                        "starting position kline stream symbols=%s interval=%s",
+                        ",".join(symbols),
+                        interval,
+                    )
+                    stream_task = asyncio.create_task(
+                        self._consume_position_klines(set(symbols), interval)
+                    )
+            elif stream_task is not None and stream_task.done():
+                logger.warning("position kline stream stopped unexpectedly, restarting")
+                stream_task = asyncio.create_task(
+                    self._consume_position_klines(set(symbols), interval)
+                )
+            await asyncio.sleep(5)
+
+    async def _consume_position_klines(self, symbols: set[str], interval: str) -> None:
+        async for kline in self.client.kline_stream(symbols, interval=interval):
+            self.execution.update_closed_kline(kline)
 
     async def _handle_tick(self, tick: PriceTick) -> None:
         state = self.states[tick.symbol]
@@ -397,15 +449,20 @@ class MarketScanner:
         if kline.quote_volume_usdt <= 0:
             return self._rejected_signal_evaluation(log, "zero_kline_quote_volume")
 
-        close_position = self._close_position(kline.low, kline.high, kline.close)
+        close_position = self._close_position(
+            low=kline.low,
+            high=kline.high,
+            close=kline.close,
+            direction=pending.direction,
+        )
         log["close_position"] = close_position
         if close_position is None:
             return self._rejected_signal_evaluation(log, "invalid_candle_range")
         if pending.direction == Direction.LONG:
-            if close_position < self.config["signal"]["long_close_position_min"]:
-                return self._rejected_signal_evaluation(log, "long_close_below_required_range")
-        elif close_position > self.config["signal"]["short_close_position_max"]:
-            return self._rejected_signal_evaluation(log, "short_close_above_required_range")
+            if close_position > self._long_close_distance_max():
+                return self._rejected_signal_evaluation(log, "long_close_too_far_from_high")
+        elif close_position > self._short_close_distance_max():
+            return self._rejected_signal_evaluation(log, "short_close_too_far_from_low")
 
         oi_value_to_volume_ratio = max(oi.delta_value_usdt, 0.0) / kline.quote_volume_usdt
         log["oi_value_to_volume_ratio"] = oi_value_to_volume_ratio
@@ -523,12 +580,31 @@ class MarketScanner:
             return snapshot.return_60s
         return None
 
+    def _long_close_distance_max(self) -> float:
+        signal_config = self.config["signal"]
+        if "long_close_distance_max" in signal_config:
+            return float(signal_config["long_close_distance_max"])
+        return max(1.0 - float(signal_config.get("long_close_position_min", 0.999)), 0.0)
+
+    def _short_close_distance_max(self) -> float:
+        signal_config = self.config["signal"]
+        if "short_close_distance_max" in signal_config:
+            return float(signal_config["short_close_distance_max"])
+        return float(signal_config.get("short_close_position_max", 0.001))
+
     @staticmethod
-    def _close_position(low: float, high: float, close: float) -> float | None:
-        candle_range = high - low
-        if candle_range <= 0:
+    def _close_position(
+        *,
+        low: float,
+        high: float,
+        close: float,
+        direction: Direction,
+    ) -> float | None:
+        if low <= 0 or high <= 0:
             return None
-        return (close - low) / candle_range
+        if direction == Direction.LONG:
+            return max((high - close) / high, 0.0)
+        return max((close - low) / low, 0.0)
 
     @staticmethod
     def _oldest_tick_at_or_before(state: SymbolState, timestamp_ms: int) -> PriceTick | None:

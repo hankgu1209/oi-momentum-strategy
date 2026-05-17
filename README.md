@@ -47,6 +47,8 @@ This is a high-risk research project. Low-liquidity futures can have large sprea
   - `GET https://fapi.binance.com/futures/data/openInterestHist?symbol=BTCUSDT&period=5m`
 - Klines:
   - `GET https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m`
+- Position trailing Klines:
+  - `wss://fstream.binance.com/ws/<symbol>@kline_<interval>`
 
 ## Project Layout
 
@@ -106,14 +108,16 @@ For each low-liquidity USDT perpetual symbol, the scanner:
 - Does not trade immediately after the candidate appears.
 - Waits for the current 1m candle to close, then fetches `/fapi/v1/continuousKlines`.
 - Requires the latest closed 1m quote volume to be at least `2x` the average quote volume of the previous 30 one-minute candles.
-- Requires the closed 1m candle close to be near the extreme of its own high-low range:
-  - long: close position >= 95%
-  - short: close position <= 5%
+- Requires the closed 1m candle close to be near the directional extreme:
+  - long: `(high - close) / high <= 0.1%`
+  - short: `(close - low) / low <= 0.1%`
 - Requires taker buy quote volume ratio >= 60% for longs.
 - Requires taker sell quote volume ratio >= 60% for shorts.
 - Fetches `/futures/data/openInterestHist` and requires new OI / previous OI to meet the configured threshold.
 - Records every candidate check in the dashboard `Log` tab, including price change, Kline volume, taker buy/sell ratio, OI change, score, and reject reason.
 - Records every accepted signal and opens a paper position using the closed 1m candle close as entry price.
+- If scale-out take profit is enabled, TP1 closes the configured fraction of the paper position, then the remainder uses a Binance Kline WebSocket stream for trailing pivot exits.
+- Long trailing stop uses the down pivot from the previous `N` closed Klines; short trailing stop uses the up pivot from the previous `N` closed Klines.
 
 ## Docker Deployment
 
@@ -253,9 +257,24 @@ Example:
 DASHBOARD_DOMAIN=dashboard.your-domain.com
 DASHBOARD_USER=admin
 DASHBOARD_PASSWORD_HASH='$2a$14$...'
+CADDY_HTTP_PORT=80
+CADDY_HTTPS_PORT=443
 ```
 
 Keep the password hash wrapped in single quotes so Docker Compose does not interpret the `$` characters.
+
+If port `443` is already used by another service such as xray, keep that service running and publish Caddy HTTPS on another port:
+
+```text
+CADDY_HTTP_PORT=80
+CADDY_HTTPS_PORT=8443
+```
+
+Then open TCP `8443` in the security group and visit:
+
+```text
+https://dashboard.your-domain.com:8443
+```
 
 5. Start with the `domain` profile:
 
@@ -273,6 +292,27 @@ https://dashboard.your-domain.com
 If Binance access times out from the server, add proxy environment variables in `docker-compose.yml` under both services, then restart:
 
 ```bash
+docker compose up -d
+```
+
+If local WebSocket startup fails with `connecting through a SOCKS proxy requires python-socks`, reinstall the project dependencies in your virtual environment:
+
+```bash
+python -m pip install -e .
+```
+
+That error means your shell has a SOCKS proxy environment variable such as `ALL_PROXY=socks5://...`, and the `websockets` package needs `python-socks` to use it.
+
+If Docker build can pull the base image but fails while installing Python dependencies from PyPI, set a build index mirror in `.env`:
+
+```text
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+Then rebuild:
+
+```bash
+docker compose build --no-cache
 docker compose up -d
 ```
 

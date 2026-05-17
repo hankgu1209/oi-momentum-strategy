@@ -106,6 +106,19 @@ class KlineVolumeContext:
 
 
 @dataclass(frozen=True)
+class KlineClosed:
+    symbol: str
+    interval: str
+    open_time_ms: int
+    close_time_ms: int
+    open: float
+    high: float
+    low: float
+    close: float
+    is_closed: bool
+
+
+@dataclass(frozen=True)
 class PaperPosition:
     id: int | None
     signal_id: int
@@ -119,6 +132,20 @@ class PaperPosition:
     stop_loss_price: float
     take_profit_price: float
     max_hold_seconds: int
+    initial_quantity: float | None = None
+    remaining_quantity: float | None = None
+    remaining_notional_usdt: float | None = None
+    scale_out_enabled: bool = False
+    trailing_active: bool = False
+    take_profit_1_price: float | None = None
+    take_profit_2_price: float | None = None
+    take_profit_1_time_ms: int | None = None
+    take_profit_1_exit_price: float | None = None
+    take_profit_1_quantity: float | None = None
+    take_profit_1_pnl_usdt: float | None = None
+    take_profit_1_pnl_pct: float | None = None
+    trailing_stop_price: float | None = None
+    trailing_pivot_window: int | None = None
     exit_time_ms: int | None = None
     exit_price: float | None = None
     exit_reason: str | None = None
