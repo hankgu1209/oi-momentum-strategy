@@ -401,7 +401,7 @@ def render_config_editor(config_path: str, config) -> None:
         )
 
         st.subheader("Advanced")
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         exchange["request_timeout_seconds"] = c1.number_input(
             "REST timeout seconds",
             min_value=1,
@@ -415,6 +415,20 @@ def render_config_editor(config_path: str, config) -> None:
             value=int(exchange["rest_retries"]),
             step=1,
             help="Binance REST 请求失败后的最大重试次数。",
+        )
+        signal["precheck_log_cooldown_seconds"] = c3.number_input(
+            "Precheck log cooldown seconds",
+            min_value=0,
+            value=int(signal.get("precheck_log_cooldown_seconds", 60)),
+            step=10,
+            help="价格阈值已触发但被流动性或冷却过滤时，Log 记录的最小间隔，避免同一 symbol 刷屏。",
+        )
+        signal["price_carry_forward_interval_seconds"] = c3.number_input(
+            "Price carry-forward seconds",
+            min_value=0,
+            value=int(signal.get("price_carry_forward_interval_seconds", 5)),
+            step=1,
+            help="miniTicker 只推变化的 symbol。这里定期把最新价格复制进本地窗口，避免冷门币暴涨前没有 60 秒基准价。",
         )
 
         submitted = st.form_submit_button("Save config", type="primary")
@@ -488,7 +502,7 @@ def render_strategy_logic(config) -> None:
                 {
                     "用途": "全市场价格扫描",
                     "接口": "`!miniTicker@arr` WebSocket",
-                    "说明": "维护本地短线价格窗口，更新最新价和 24h quote volume。",
+                    "说明": "维护本地短线价格窗口，更新最新价和 24h quote volume。miniTicker 只推变化 ticker，因此启动时会用 REST 24hr ticker 预热价格窗口，并定期 carry-forward 最新价。",
                 },
                 {
                     "用途": "候选后成交量确认",
@@ -497,8 +511,8 @@ def render_strategy_logic(config) -> None:
                 },
                 {
                     "用途": "OI 确认",
-                    "接口": "`/futures/data/openInterestHist` REST",
-                    "说明": "比较最近两个 5m OI 快照，计算新增 OI / 上一个 OI。",
+                    "接口": "`/fapi/v1/openInterest` + `/futures/data/openInterestHist` REST",
+                    "说明": "用实时 OI qty 对比最近 5m OI 快照 qty，计算新增 OI / 快照 OI。",
                 },
                 {
                     "用途": "持仓 trailing",
@@ -526,15 +540,17 @@ def render_strategy_logic(config) -> None:
     st.subheader("Signal Pipeline")
     st.markdown(
         f"""
-        1. 接收 `!miniTicker@arr` 全市场 tick，并为每个 symbol 维护 `{signal["windows_seconds"]}` 秒价格窗口。
-        2. 对每个窗口计算 `price_return = (current_price - window_base_price) / window_base_price`。
-        3. `{primary_window}` 秒涨幅 `>= {long_threshold * 100:.2f}%` 形成做多候选。
-        4. `{primary_window}` 秒跌幅 `<= {short_threshold * 100:.2f}%` 形成做空候选。
-        5. 候选不会立刻交易，而是等待当前 `{signal["kline_interval"]}` K 线收线，并额外等待 `{signal["kline_close_delay_ms"]}` ms。
-        6. 收线后拉 `/fapi/v1/continuousKlines`，获取最新已收线 K 和前 `{signal["kline_lookback"]}` 根 K 的平均成交额。
-        7. 再拉 `/futures/data/openInterestHist`，比较最近两个 5m OI 快照。
-        8. 通过方向、成交额、OI、主动买卖比例和分数过滤后，记录有效 signal。
-        9. 通过风控后开启纸面仓位，入场价使用已收线 K 的 close。
+        1. 启动时用 `/fapi/v1/ticker/24hr` 预热每个 symbol 的最新价，解决冷门币暴涨前没有历史 tick 的问题。
+        2. 接收 `!miniTicker@arr` 全市场 tick，并为每个 symbol 维护 `{signal["windows_seconds"]}` 秒价格窗口。
+        3. 因 miniTicker 只推变化 ticker，后端每 `{signal.get("price_carry_forward_interval_seconds", 5)}` 秒把最新价 carry-forward 到本地窗口，保留 60s 基准价。
+        4. 对每个窗口计算 `price_return = (current_price - window_base_price) / window_base_price`。
+        5. `{primary_window}` 秒涨幅 `>= {long_threshold * 100:.2f}%` 形成做多候选。
+        6. `{primary_window}` 秒跌幅 `<= {short_threshold * 100:.2f}%` 形成做空候选。
+        7. 候选不会立刻交易，而是等待当前 `{signal["kline_interval"]}` K 线收线，并额外等待 `{signal["kline_close_delay_ms"]}` ms。
+        8. 收线后拉 `/fapi/v1/continuousKlines`，获取最新已收线 K 和前 `{signal["kline_lookback"]}` 根 K 的平均成交额。
+        9. 再拉 `/fapi/v1/openInterest` 获取实时 OI qty，并用 `/futures/data/openInterestHist` 最近 5m 快照作为 baseline。
+        10. 通过方向、成交额、OI、主动买卖比例和分数过滤后，记录有效 signal。
+        11. 通过风控后开启纸面仓位，入场价使用已收线 K 的 close。
         """
     )
 
@@ -576,12 +592,12 @@ def render_strategy_logic(config) -> None:
             [
                 {
                     "过滤项": "OI delta pct",
-                    "定义": "`(current_oi - previous_oi) / previous_oi`",
+                    "定义": "`(realtime_oi_qty - latest_5m_snapshot_oi_qty) / latest_5m_snapshot_oi_qty`",
                     "当前阈值": f">= {signal['oi_delta_pct_min'] * 100:.2f}%",
                 },
                 {
                     "过滤项": "OI value / volume",
-                    "定义": "`max(oi_delta_value, 0) / latest_quote_volume`",
+                    "定义": "`max(oi_qty_delta * close_price, 0) / latest_quote_volume`",
                     "当前阈值": f">= {signal['oi_value_to_volume_ratio_min']:.2f}",
                 },
                 {
@@ -671,6 +687,8 @@ def render_strategy_logic(config) -> None:
         - `missing_open_interest_data`: OI 数据为空
         - `long_close_too_far_from_high`: 做多收盘价离 high 太远
         - `short_close_too_far_from_low`: 做空收盘价离 low 太远
+        - `liquidity_filter_failed`: 价格阈值已触发，但 24h quote volume 不在 universe 流动性范围内
+        - `signal_cooldown_active`: 价格阈值已触发，但该 symbol 仍在信号冷却期
         - `volume_ratio_below_min`: 成交额放大倍数不足
         - `oi_delta_pct_below_min`: OI 增幅不足
         - `oi_value_to_volume_below_min`: OI value 增量相对成交额不足
@@ -690,10 +708,10 @@ def render_strategy_logic(config) -> None:
         - `average_quote_volume_usdt`: 过去 30 根 1m K 线的平均 quote volume
         - `volume_ratio`: 最新 1m K 线成交额相对过去 30 分钟平均成交额的倍数
         - `taker_buy_ratio` / `taker_sell_ratio`: 最新 1m K 线主动买入/主动卖出 quote volume 占比
-        - `open_interest`: 触发时最新 OI
-        - `open_interest_value_usdt`: 触发时最新 OI value
-        - `oi_delta_pct`: 新增 OI / 上一个 OI
-        - `oi_delta_value_usdt`: OI value 的 USDT 增量
+        - `open_interest`: 触发时实时 `/fapi/v1/openInterest` OI qty
+        - `open_interest_value_usdt`: 实时 OI qty * 收线价估算值
+        - `oi_delta_pct`: 实时 OI qty 相对最近 5m 快照 OI qty 的增幅
+        - `oi_delta_value_usdt`: OI qty 增量 * 收线价的估算 USDT 增量
         - `oi_value_to_volume_ratio`: OI value 增量 / 最近窗口成交额
         - `score`: 综合打分
         - `risk_allowed` / `risk_reason`: 是否通过风控以及原因

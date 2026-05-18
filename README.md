@@ -41,6 +41,8 @@ This is a high-risk research project. Low-liquidity futures can have large sprea
 
 - WebSocket ticker scan:
   - `wss://fstream.binance.com/market/stream?streams=!miniTicker@arr`
+- Startup price warmup:
+  - `GET https://fapi.binance.com/fapi/v1/ticker/24hr`
 - Current open interest:
   - `GET https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT`
 - Historical open interest baseline:
@@ -104,9 +106,12 @@ The dashboard `Config` tab edits `configs/strategy.local.yaml` by default. This 
 
 For each low-liquidity USDT perpetual symbol, the scanner:
 
+- Seeds the local price windows from `/fapi/v1/ticker/24hr` at startup.
 - Uses `!miniTicker@arr` WebSocket ticks to maintain a rolling 60s price window.
+- Because mini ticker array streams only include changed tickers, carries each symbol's latest price forward every few seconds so inactive symbols still have a 60s baseline before a sudden move.
 - Creates a long candidate when the 60s price return is at least `+2%`.
 - Creates a short candidate when the 60s price return is at most `-2%`.
+- If the price threshold is hit but the symbol fails the 24h quote-volume universe filter or is still in cooldown, records a lightweight precheck reject in the dashboard `Log` tab.
 - Does not trade immediately after the candidate appears.
 - Waits for the current 1m candle to close, then fetches `/fapi/v1/continuousKlines`.
 - Requires the latest closed 1m quote volume to be at least `2x` the average quote volume of the previous 30 one-minute candles.
@@ -115,7 +120,8 @@ For each low-liquidity USDT perpetual symbol, the scanner:
   - short: `(close - low) / low <= 0.1%`
 - Requires taker buy quote volume ratio >= 60% for longs.
 - Requires taker sell quote volume ratio >= 60% for shorts.
-- Fetches `/futures/data/openInterestHist` and requires new OI / previous OI to meet the configured threshold.
+- Fetches realtime `/fapi/v1/openInterest` for current OI qty and `/futures/data/openInterestHist` for the latest 5m snapshot baseline.
+- Requires `(current OI qty - latest 5m snapshot OI qty) / latest 5m snapshot OI qty` to meet the configured threshold.
 - Records every candidate check in the dashboard `Log` tab, including price change, Kline volume, taker buy/sell ratio, OI change, score, and reject reason.
 - Records every accepted signal and opens a paper position using the closed 1m candle close as entry price.
 - If scale-out take profit is enabled, TP1 closes the configured fraction of the paper position, then the remainder uses a Binance Kline WebSocket stream for trailing pivot exits.
@@ -147,6 +153,41 @@ To check the release:
 ```bash
 docker compose ps
 docker compose logs -f --tail=100 scanner dashboard caddy
+```
+
+### One-Time Server Migration
+
+If an old server was deployed before runtime SQLite and local strategy config were ignored by Git, the first `git pull` may fail with files like:
+
+```text
+data/events.sqlite3
+configs/strategy.example.yaml
+.gitignore
+```
+
+Run this once on the server to preserve the SQLite database, move the live config to `strategy.local.yaml`, and let Git own only the template files:
+
+```bash
+cd /opt/oi-momentum-strategy
+
+BK="backups/events-$(date +%Y%m%d-%H%M%S).sqlite3"
+mkdir -p backups
+cp data/events.sqlite3 "$BK"
+
+git rm --cached data/events.sqlite3
+git checkout -- .gitignore
+git pull --ff-only origin main
+cp "$BK" data/events.sqlite3
+
+cp configs/strategy.example.yaml configs/strategy.local.yaml
+git checkout -- configs/strategy.example.yaml
+rm -f configs/strategy.example.yaml.bak
+```
+
+After this migration, normal releases should use only:
+
+```bash
+./scripts/deploy-domain.sh --pull
 ```
 
 ### Local Docker Run

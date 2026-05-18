@@ -65,6 +65,13 @@ class PriceTick:
 
 
 @dataclass(frozen=True)
+class CurrentOpenInterest:
+    symbol: str
+    timestamp_ms: int
+    open_interest: float
+
+
+@dataclass(frozen=True)
 class OIContext:
     symbol: str
     timestamp_ms: int

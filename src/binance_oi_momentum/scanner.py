@@ -10,7 +10,7 @@ from pathlib import Path
 from .binance import BinanceMarketClient
 from .config import load_config
 from .execution import PaperExecutionEngine
-from .models import Direction, MarketSnapshot, PriceTick, SignalContext
+from .models import CurrentOpenInterest, Direction, MarketSnapshot, OIContext, PriceTick, SignalContext
 from .risk import evaluate_probe_risk
 from .storage import SQLiteStorage
 from .strategy import infer_candidate_direction, score_signal
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 class SymbolState:
     ticks: deque[PriceTick] = field(default_factory=lambda: deque(maxlen=600))
     last_signal_at_ms: int | None = None
+    last_precheck_reject_at_ms: int | None = None
     pending_candidate: PendingCandidate | None = None
 
 
@@ -71,6 +72,7 @@ class MarketScanner:
         self.symbols: set[str] = set()
         self._last_heartbeat_ms = 0
         self._last_config_check_ms = 0
+        self._last_carry_forward_ms = 0
         self.config_path = Path(config["_config_path"]) if config.get("_config_path") else None
         self.config_mtime: float | None = (
             self.config_path.stat().st_mtime if self.config_path and self.config_path.exists() else None
@@ -87,6 +89,7 @@ class MarketScanner:
                 await asyncio.sleep(30)
 
         self.storage.record_heartbeat(self._now_ms(), "running", f"universe={len(self.symbols)}")
+        await self._seed_price_windows()
         logger.info(
             "scanner running universe=%s enabled=%s",
             len(self.symbols),
@@ -112,6 +115,7 @@ class MarketScanner:
                     await self._handle_tick(tick)
 
                 now_ms = self._now_ms()
+                self._carry_forward_prices(now_ms)
                 if now_ms - self._last_heartbeat_ms > 10_000:
                     self._last_heartbeat_ms = now_ms
                     self.storage.record_heartbeat(now_ms, "running", f"universe={len(self.symbols)}")
@@ -225,16 +229,13 @@ class MarketScanner:
 
     async def _handle_tick(self, tick: PriceTick) -> None:
         state = self.states[tick.symbol]
-        state.ticks.append(tick)
+        self._append_tick(state, tick)
         if self.execution.update_open_positions(tick.symbol, tick.price, tick.timestamp_ms):
             self.storage.record_latest_price(tick.symbol, tick.timestamp_ms, tick.price)
 
         if state.pending_candidate is not None:
             if tick.timestamp_ms >= state.pending_candidate.evaluate_after_ms:
                 await self._evaluate_pending_candidate(state)
-            return
-
-        if not self._passes_liquidity_filter(tick):
             return
 
         snapshot = self._snapshot(tick.symbol, state, tick)
@@ -245,12 +246,18 @@ class MarketScanner:
         if direction is None:
             return
 
-        if self._in_signal_cooldown(tick.symbol, tick.timestamp_ms, state):
-            return
-
         pending = self._build_pending_candidate(tick, snapshot, direction)
         if pending is None:
             return
+
+        if not self._passes_liquidity_filter(tick):
+            self._record_precheck_reject(state, pending, "liquidity_filter_failed")
+            return
+
+        if self._in_signal_cooldown(tick.symbol, tick.timestamp_ms, state):
+            self._record_precheck_reject(state, pending, "signal_cooldown_active")
+            return
+
         state.pending_candidate = pending
         logger.info(
             "candidate queued symbol=%s direction=%s price=%.8g price_change_pct=%.4f "
@@ -262,6 +269,110 @@ class MarketScanner:
             pending.window_seconds,
             pending.evaluate_after_ms,
         )
+
+    def _record_precheck_reject(
+        self,
+        state: SymbolState,
+        pending: PendingCandidate,
+        reason: str,
+    ) -> None:
+        cooldown_ms = int(self.config["signal"].get("precheck_log_cooldown_seconds", 60)) * 1000
+        if (
+            state.last_precheck_reject_at_ms is not None
+            and pending.tick.timestamp_ms - state.last_precheck_reject_at_ms < cooldown_ms
+        ):
+            return
+
+        state.last_precheck_reject_at_ms = pending.tick.timestamp_ms
+        log = self._base_signal_check_log(pending)
+        log["reject_reason"] = reason
+        log["raw"].update(
+            {
+                "precheck_reject": True,
+                "min_24h_quote_volume": self.config["universe"].get("min_24h_quote_volume"),
+                "max_24h_quote_volume": self.config["universe"].get("max_24h_quote_volume"),
+            }
+        )
+        self.storage.record_signal_check(log)
+        logger.info(
+            "candidate precheck rejected symbol=%s direction=%s reason=%s price_change_pct=%.4f "
+            "quote_volume_24h=%.2f",
+            pending.tick.symbol,
+            pending.direction.value,
+            reason,
+            pending.price_change_pct,
+            pending.tick.quote_volume_24h,
+        )
+
+    async def _seed_price_windows(self) -> None:
+        try:
+            ticks = await self.client.ticker_24hr()
+        except Exception as exc:
+            logger.warning("failed to seed price windows: %s: %s", type(exc).__name__, exc)
+            return
+
+        max_window_seconds = max(self.config["signal"].get("windows_seconds") or [60])
+        seed_timestamp_ms = self._now_ms() - max_window_seconds * 1000
+        seeded = 0
+        for tick in ticks:
+            if tick.symbol not in self.symbols:
+                continue
+            seeded_tick = PriceTick(
+                symbol=tick.symbol,
+                timestamp_ms=seed_timestamp_ms,
+                price=tick.price,
+                open_24h=tick.open_24h,
+                high_24h=tick.high_24h,
+                low_24h=tick.low_24h,
+                base_volume_24h=tick.base_volume_24h,
+                quote_volume_24h=tick.quote_volume_24h,
+            )
+            self._append_tick(self.states[tick.symbol], seeded_tick)
+            seeded += 1
+
+        logger.info(
+            "price windows seeded symbols=%s seed_timestamp_ms=%s",
+            seeded,
+            seed_timestamp_ms,
+        )
+
+    def _carry_forward_prices(self, now_ms: int) -> None:
+        interval_ms = int(self.config["signal"].get("price_carry_forward_interval_seconds", 5)) * 1000
+        if interval_ms <= 0 or now_ms - self._last_carry_forward_ms < interval_ms:
+            return
+
+        self._last_carry_forward_ms = now_ms
+        carried = 0
+        for state in self.states.values():
+            if not state.ticks:
+                continue
+            latest = state.ticks[-1]
+            if latest.timestamp_ms >= now_ms:
+                continue
+            self._append_tick(
+                state,
+                PriceTick(
+                    symbol=latest.symbol,
+                    timestamp_ms=now_ms,
+                    price=latest.price,
+                    open_24h=latest.open_24h,
+                    high_24h=latest.high_24h,
+                    low_24h=latest.low_24h,
+                    base_volume_24h=latest.base_volume_24h,
+                    quote_volume_24h=latest.quote_volume_24h,
+                ),
+            )
+            carried += 1
+
+        if carried:
+            logger.debug("price windows carried forward symbols=%s", carried)
+
+    @staticmethod
+    def _append_tick(state: SymbolState, tick: PriceTick) -> None:
+        if state.ticks and state.ticks[-1].timestamp_ms == tick.timestamp_ms:
+            state.ticks[-1] = tick
+            return
+        state.ticks.append(tick)
 
     def _build_pending_candidate(
         self,
@@ -400,14 +511,15 @@ class MarketScanner:
         pending: PendingCandidate,
     ) -> SignalEvaluation:
         log = self._base_signal_check_log(pending)
-        kline, oi = await asyncio.gather(
+        kline, current_oi, oi_snapshot = await asyncio.gather(
             self.client.kline_volume_context(
                 pending.tick.symbol,
                 interval=self.config["signal"]["kline_interval"],
                 lookback=self.config["signal"]["kline_lookback"],
                 end_time_ms=pending.candle_close_time_ms,
             ),
-            self.client.open_interest_hist(pending.tick.symbol, period="5m", limit=2),
+            self.client.open_interest(pending.tick.symbol),
+            self.client.open_interest_hist(pending.tick.symbol, period="5m", limit=1),
             return_exceptions=True,
         )
         if isinstance(kline, Exception):
@@ -418,18 +530,32 @@ class MarketScanner:
                 log["raw"]["kline_error"],
             )
             return self._rejected_signal_evaluation(log, "kline_request_failed")
-        if isinstance(oi, Exception):
-            log["raw"]["open_interest_error"] = f"{type(oi).__name__}: {oi}"
+        if isinstance(current_oi, Exception):
+            log["raw"]["open_interest_error"] = f"{type(current_oi).__name__}: {current_oi}"
             logger.warning(
-                "open interest request failed symbol=%s error=%s",
+                "current open interest request failed symbol=%s error=%s",
                 pending.tick.symbol,
                 log["raw"]["open_interest_error"],
             )
             return self._rejected_signal_evaluation(log, "open_interest_request_failed")
+        if isinstance(oi_snapshot, Exception):
+            log["raw"]["open_interest_hist_error"] = f"{type(oi_snapshot).__name__}: {oi_snapshot}"
+            logger.warning(
+                "open interest snapshot request failed symbol=%s error=%s",
+                pending.tick.symbol,
+                log["raw"]["open_interest_hist_error"],
+            )
+            return self._rejected_signal_evaluation(log, "open_interest_request_failed")
         if kline is None:
             return self._rejected_signal_evaluation(log, "missing_kline_data")
-        if oi is None:
+        if current_oi is None or oi_snapshot is None:
             return self._rejected_signal_evaluation(log, "missing_open_interest_data")
+
+        oi = self._realtime_oi_context(
+            current=current_oi,
+            snapshot=oi_snapshot,
+            reference_price=kline.close,
+        )
 
         log.update(
             {
@@ -532,6 +658,7 @@ class MarketScanner:
                 "high_24h": pending.tick.high_24h,
                 "low_24h": pending.tick.low_24h,
                 "quote_volume_24h": pending.tick.quote_volume_24h,
+                "open_interest_source": "current_open_interest_vs_latest_5m_snapshot",
             },
         }
 
@@ -569,6 +696,22 @@ class MarketScanner:
         if taker_sell_ratio < signal_config["taker_sell_ratio_min_for_short"]:
             return "taker_sell_ratio_below_min"
         return None
+
+    @staticmethod
+    def _realtime_oi_context(
+        *,
+        current: CurrentOpenInterest,
+        snapshot: OIContext,
+        reference_price: float,
+    ) -> OIContext:
+        return OIContext(
+            symbol=current.symbol,
+            timestamp_ms=current.timestamp_ms,
+            open_interest=current.open_interest,
+            open_interest_value_usdt=current.open_interest * reference_price,
+            previous_open_interest=snapshot.open_interest,
+            previous_open_interest_value_usdt=snapshot.open_interest * reference_price,
+        )
 
     @staticmethod
     def _return_for_window(snapshot: MarketSnapshot, window_seconds: int) -> float | None:

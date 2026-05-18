@@ -39,6 +39,8 @@ signal:
   oi_sample_interval_seconds: 10
   oi_delta_pct_min: 0.03
   signal_cooldown_seconds: 300
+  precheck_log_cooldown_seconds: 60
+  price_carry_forward_interval_seconds: 5
   score_probe_min: 70
   score_add_min: 85
   score_exit_threshold: 50

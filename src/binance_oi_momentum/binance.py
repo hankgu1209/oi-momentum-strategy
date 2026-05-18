@@ -10,7 +10,7 @@ from typing import Any
 import aiohttp
 import websockets
 
-from .models import KlineClosed, KlineVolumeContext, OIContext, PriceTick
+from .models import CurrentOpenInterest, KlineClosed, KlineVolumeContext, OIContext, PriceTick
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,24 @@ class BinanceMarketClient:
 
     async def exchange_info(self) -> dict[str, Any]:
         return await self._get_json("/fapi/v1/exchangeInfo")
+
+    async def ticker_24hr(self) -> list[PriceTick]:
+        payload = await self._get_json("/fapi/v1/ticker/24hr")
+        now_ms = int(time.time() * 1000)
+        return [
+            tick
+            for item in payload
+            if (tick := self._parse_ticker_24hr(item, now_ms)) is not None
+        ]
+
+    async def open_interest(self, symbol: str) -> CurrentOpenInterest:
+        params = {"symbol": symbol}
+        payload = await self._get_json("/fapi/v1/openInterest", params=params)
+        return CurrentOpenInterest(
+            symbol=str(payload["symbol"]),
+            timestamp_ms=int(payload["time"]),
+            open_interest=float(payload["openInterest"]),
+        )
 
     async def open_interest_hist(self, symbol: str, period: str = "5m", limit: int = 2) -> OIContext | None:
         params = {"symbol": symbol, "period": period, "limit": limit}
@@ -209,6 +227,22 @@ class BinanceMarketClient:
                 low_24h=float(item["l"]),
                 base_volume_24h=float(item["v"]),
                 quote_volume_24h=float(item["q"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_ticker_24hr(item: dict[str, Any], fallback_timestamp_ms: int) -> PriceTick | None:
+        try:
+            return PriceTick(
+                symbol=item["symbol"],
+                timestamp_ms=int(item.get("closeTime") or fallback_timestamp_ms),
+                price=float(item["lastPrice"]),
+                open_24h=float(item["openPrice"]),
+                high_24h=float(item["highPrice"]),
+                low_24h=float(item["lowPrice"]),
+                base_volume_24h=float(item["volume"]),
+                quote_volume_24h=float(item["quoteVolume"]),
             )
         except (KeyError, TypeError, ValueError):
             return None
