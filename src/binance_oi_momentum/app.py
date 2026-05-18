@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 import logging
+import os
 from pathlib import Path
 
 import altair as alt
@@ -15,7 +16,7 @@ from binance_oi_momentum.logging_utils import configure_logging
 from binance_oi_momentum.storage import SQLiteStorage, sqlite_path_from_url
 
 
-DEFAULT_CONFIG = "configs/strategy.example.yaml"
+DEFAULT_CONFIG = os.getenv("OI_MOMENTUM_CONFIG", "configs/strategy.local.yaml")
 configure_logging("dashboard")
 logger = logging.getLogger(__name__)
 
@@ -821,9 +822,12 @@ def render_dashboard(
     )
 
 
-def render_signal_log(signal_checks: pd.DataFrame) -> None:
+def render_signal_log(signal_checks: pd.DataFrame, signal_check_stats: pd.DataFrame, log_limit: int) -> None:
     st.header("Log")
-    st.caption("这里记录价格先达到触发阈值后，后端等待 1m 收线并调用 K线/OI 接口捕捉到的数据。被成交量、OI、主动买卖比例或收盘位置过滤掉的候选也会保留。")
+    st.caption(
+        "这里记录价格先达到触发阈值后，后端等待 1m 收线并调用 K线/OI 接口捕捉到的数据。"
+        f"当前表格显示最新 {log_limit} 条；数据库会继续累计，不会因为前端显示上限停止写入。"
+    )
 
     if signal_checks.empty:
         st.info("No signal checks yet. Scanner needs a price move candidate before this table has data.")
@@ -835,12 +839,19 @@ def render_signal_log(signal_checks: pd.DataFrame) -> None:
     signal_checks["passed"] = signal_checks["passed"].astype(bool)
 
     passed_count = int(signal_checks["passed"].sum())
+    total_checks = len(signal_checks)
+    latest_check_id = None
+    if not signal_check_stats.empty:
+        total_checks = int(signal_check_stats.iloc[0].get("total_checks") or len(signal_checks))
+        latest_check_id = signal_check_stats.iloc[0].get("latest_check_id")
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Checks", len(signal_checks))
-    c2.metric("Passed", passed_count)
+    c1.metric("Total checks", total_checks)
+    c2.metric("Shown", len(signal_checks))
     c3.metric("Pass rate", f"{passed_count / len(signal_checks) * 100:.1f}%")
     latest_reason = str(signal_checks.iloc[0]["reject_reason"] or "passed")
-    c4.metric("Latest result", latest_reason)
+    latest_label = latest_reason if latest_check_id is None else f"#{int(latest_check_id)} {latest_reason}"
+    c4.metric("Latest result", latest_label)
 
     reason_counts = (
         signal_checks.assign(result=signal_checks["reject_reason"].replace("", "passed"))
@@ -1096,6 +1107,7 @@ def main() -> None:
         config_path = st.text_input("Config", DEFAULT_CONFIG)
         auto_refresh = st.toggle("Auto refresh", value=True)
         refresh_seconds = st.slider("Refresh seconds", 3, 60, 10)
+        log_limit = st.selectbox("Log rows", [1000, 3000, 5000, 10000], index=0)
 
     config = load_config(config_path)
     SQLiteStorage(config.storage["database_url"])
@@ -1123,11 +1135,21 @@ def main() -> None:
     )
     signal_checks = read_table(
         str(database_path),
-        """
+        f"""
         SELECT *
         FROM signal_checks
-        ORDER BY checked_at_ms DESC
-        LIMIT 1000
+        ORDER BY checked_at_ms DESC, id DESC
+        LIMIT {int(log_limit)}
+        """,
+    )
+    signal_check_stats = read_table(
+        str(database_path),
+        """
+        SELECT
+            COUNT(*) AS total_checks,
+            MAX(id) AS latest_check_id,
+            MAX(checked_at_ms) AS latest_checked_at_ms
+        FROM signal_checks
         """,
     )
     positions = read_table(
@@ -1163,7 +1185,7 @@ def main() -> None:
         render_dashboard(heartbeat=heartbeat, signals=signals, positions=positions)
 
     with log_tab:
-        render_signal_log(signal_checks)
+        render_signal_log(signal_checks, signal_check_stats, int(log_limit))
 
     with chart_tab:
         render_position_chart(config, positions)

@@ -33,7 +33,11 @@ logs/
 # Data / output
 data/
 outputs/
+configs/*.local.yaml*
 *.csv
 *.parquet
 *.db
 *.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

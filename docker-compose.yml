@@ -7,15 +7,16 @@ services:
     image: oi-momentum:latest
     container_name: oi-momentum-scanner
     restart: unless-stopped
-    command: ["python", "-m", "binance_oi_momentum.cli", "--config", "configs/strategy.example.yaml"]
+    command: ["python", "-m", "binance_oi_momentum.cli", "--config", "${CONFIG_PATH:-configs/strategy.local.yaml}"]
     environment:
       TZ: Asia/Shanghai
       LOG_LEVEL: INFO
+      OI_MOMENTUM_CONFIG: ${CONFIG_PATH:-configs/strategy.local.yaml}
       # If your server needs a proxy to reach Binance, uncomment and edit:
       # HTTP_PROXY: http://host.docker.internal:7890
       # HTTPS_PROXY: http://host.docker.internal:7890
     volumes:
-      - ./configs:/app/configs:ro
+      - ./configs:/app/configs
       - ./data:/app/data
 
   dashboard:
@@ -39,6 +40,7 @@ services:
     environment:
       TZ: Asia/Shanghai
       LOG_LEVEL: INFO
+      OI_MOMENTUM_CONFIG: ${CONFIG_PATH:-configs/strategy.local.yaml}
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
       # If your server needs a proxy to reach Binance, uncomment and edit:
       # HTTP_PROXY: http://host.docker.internal:7890

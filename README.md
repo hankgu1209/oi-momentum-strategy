@@ -55,6 +55,7 @@ This is a high-risk research project. Low-liquidity futures can have large sprea
 ```text
 configs/
   strategy.example.yaml
+  strategy.local.yaml  # local runtime config, ignored by Git
 docs/
   strategy.md
 src/
@@ -85,7 +86,8 @@ python3 -m pytest
 Run the backend scanner in one terminal:
 
 ```bash
-oi-momentum-scan --config configs/strategy.example.yaml
+cp configs/strategy.example.yaml configs/strategy.local.yaml
+oi-momentum-scan --config configs/strategy.local.yaml
 ```
 
 Run the Streamlit dashboard in another terminal:
@@ -96,7 +98,7 @@ streamlit run src/binance_oi_momentum/app.py
 
 The current implementation is a non-trading research and paper-trading logger. It subscribes to the Binance all-market mini ticker stream, keeps short rolling windows locally, fetches Kline and `openInterestHist` data only after a price candidate appears, records both candidate checks and accepted signals into SQLite, and opens simulated positions with fixed stop loss, take profit, and max holding time. Do not connect live trading keys until the signal has been measured through backtest and paper trading.
 
-The dashboard `Config` tab includes a `Scanner enabled` switch. Turn it off and save before changing strategy parameters; the backend process stays alive and hot-reloads the YAML, but it stops processing market ticks and will not create new signals or paper positions. Turn it back on and save when you are ready to resume scanning.
+The dashboard `Config` tab edits `configs/strategy.local.yaml` by default. This file is ignored by Git, so server-side parameter changes do not block future deploys. It includes a `Scanner enabled` switch. Turn it off and save before changing strategy parameters; the backend process stays alive and hot-reloads the YAML, but it stops processing market ticks and will not create new signals or paper positions. Turn it back on and save when you are ready to resume scanning.
 
 ## Signal Logic
 
@@ -126,13 +128,32 @@ The Docker setup runs two containers from the same image:
 - `oi-momentum-scanner`: backend scanner and paper trader
 - `oi-momentum-dashboard`: Streamlit frontend on port `8501`
 
-Both containers share `./data`, so `data/events.sqlite3` persists across restarts.
-The dashboard can edit `configs/strategy.example.yaml`; the scanner checks that file every few seconds and hot-reloads strategy/risk/exit settings without rebuilding the Docker image.
+Both containers share `./data`, so `data/events.sqlite3` persists across restarts. Runtime SQLite files are ignored by Git.
+The dashboard can edit `configs/strategy.local.yaml`; the scanner checks that file every few seconds and hot-reloads strategy/risk/exit settings without rebuilding the Docker image. `strategy.local.yaml` is ignored by Git; `strategy.example.yaml` is only the template kept in version control.
+
+### Server Release
+
+After pushing code from your local machine, release the domain-enabled deployment on the server with:
+
+```bash
+cd /opt/oi-momentum-strategy
+./scripts/deploy-domain.sh --pull
+```
+
+This is the default server release command. It pulls `main`, keeps `data/events.sqlite3` as runtime data, ensures `configs/strategy.local.yaml` exists, and starts Docker Compose with the `domain` profile so Caddy stays online.
+
+To check the release:
+
+```bash
+docker compose ps
+docker compose logs -f --tail=100 scanner dashboard caddy
+```
 
 ### Local Docker Run
 
 ```bash
 mkdir -p data
+cp configs/strategy.example.yaml configs/strategy.local.yaml
 docker compose up -d --build
 docker compose logs -f scanner
 ```
@@ -157,7 +178,7 @@ docker compose down
 After changing parameters in the dashboard `Config` tab, watch for a scanner log line like:
 
 ```text
-config reloaded from configs/strategy.example.yaml
+config reloaded from configs/strategy.local.yaml
 ```
 
 No image rebuild is needed for threshold changes. If you change exchange URLs, mounted paths, or code, restart/rebuild the containers.
@@ -259,6 +280,7 @@ DASHBOARD_USER=admin
 DASHBOARD_PASSWORD_HASH='$2a$14$...'
 CADDY_HTTP_PORT=80
 CADDY_HTTPS_PORT=443
+CONFIG_PATH=configs/strategy.local.yaml
 ```
 
 Keep the password hash wrapped in single quotes so Docker Compose does not interpret the `$` characters.
@@ -279,7 +301,7 @@ https://dashboard.your-domain.com:8443
 5. Start with the `domain` profile:
 
 ```bash
-docker compose --profile domain up -d --build
+./scripts/deploy-domain.sh
 docker compose logs -f caddy dashboard scanner
 ```
 
@@ -288,6 +310,24 @@ Then open:
 ```text
 https://dashboard.your-domain.com
 ```
+
+For later releases, push your code from your local machine, then run this on the server:
+
+```bash
+cd /opt/oi-momentum-strategy
+./scripts/deploy-domain.sh --pull
+```
+
+This command always starts the `domain` profile, keeps Caddy enabled, creates `configs/strategy.local.yaml` from the template when missing, and leaves `data/events.sqlite3` as runtime data.
+
+If you prefer to run the commands manually, use:
+
+```bash
+git pull --ff-only origin main
+docker compose --profile domain up -d --build
+```
+
+Do not use plain `docker compose up -d --build` on the server when the domain is enabled, because that does not start services that are behind the `domain` profile.
 
 If Binance access times out from the server, add proxy environment variables in `docker-compose.yml` under both services, then restart:
 

@@ -33,7 +33,14 @@ class StrategyConfig:
 
 
 def load_config(path: str | Path) -> StrategyConfig:
-    with Path(path).open("r", encoding="utf-8") as file:
+    target = Path(path)
+    if not target.exists() and target.name == "strategy.local.yaml":
+        template = target.with_name("strategy.example.yaml")
+        if template.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(template, target)
+
+    with target.open("r", encoding="utf-8") as file:
         raw = yaml.safe_load(file)
     return StrategyConfig(**raw)
 

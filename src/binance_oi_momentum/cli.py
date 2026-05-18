@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 
 from .config import load_config
 from .logging_utils import configure_logging
@@ -17,7 +18,7 @@ def run_scanner() -> None:
     parser = argparse.ArgumentParser(description="Run the Binance OI momentum research scanner.")
     parser.add_argument(
         "--config",
-        default="configs/strategy.example.yaml",
+        default=os.getenv("OI_MOMENTUM_CONFIG", "configs/strategy.local.yaml"),
         help="Path to strategy YAML config.",
     )
     args = parser.parse_args()
