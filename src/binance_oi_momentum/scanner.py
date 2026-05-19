@@ -197,7 +197,6 @@ class MarketScanner:
                     {
                         position.symbol
                         for position in self.storage.get_open_positions()
-                        if position.scale_out_enabled
                     }
                 )
             )
@@ -225,12 +224,12 @@ class MarketScanner:
 
     async def _consume_position_klines(self, symbols: set[str], interval: str) -> None:
         async for kline in self.client.kline_stream(symbols, interval=interval):
-            self.execution.update_closed_kline(kline)
+            self.execution.update_position_kline(kline)
 
     async def _handle_tick(self, tick: PriceTick) -> None:
         state = self.states[tick.symbol]
         self._append_tick(state, tick)
-        if self.execution.update_open_positions(tick.symbol, tick.price, tick.timestamp_ms):
+        if self.execution.has_open_position(tick.symbol):
             self.storage.record_latest_price(tick.symbol, tick.timestamp_ms, tick.price)
 
         if state.pending_candidate is not None:

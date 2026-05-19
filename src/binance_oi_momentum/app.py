@@ -657,6 +657,12 @@ def render_strategy_logic(config) -> None:
         - Max hold: `{exit_config["max_hold_seconds"]}` seconds
         - Scale out enabled: `{exit_config.get("scale_out_enabled", False)}`
         - TP1 close fraction: `{exit_config.get("first_take_profit_fraction", 0.5):.2f}`
+
+        持仓开启后，后端订阅该 symbol 的 Kline WebSocket。止盈/止损不再用 last/close price 判断，而是模拟真实挂单：
+
+        - 多单：K 线 `high >= take_profit_price` 视为止盈成交，`low <= stop_loss_price` 视为止损成交
+        - 空单：K 线 `low <= take_profit_price` 视为止盈成交，`high >= stop_loss_price` 视为止损成交
+        - 若同一根 K 同时触发止盈和止损，当前纸面逻辑保守地优先按止损处理
         """
     )
 
@@ -667,12 +673,13 @@ def render_strategy_logic(config) -> None:
 
         1. TP1 触发：先平 `{first_take_profit_fraction * 100:.0f}%` 仓位，并记录 `take_profit_1_*` 字段。
         2. 剩余仓位进入 trailing 状态，`trailing_active = true`。
-        3. 后端启动 Binance Kline WebSocket，仅订阅当前持仓 symbol 的 `<symbol>@kline_{trailing_kline_interval}`。
-        4. 只有 `k.x=true` 的已收线 K 会参与 pivot 计算。
-        5. 多单 trailing stop 使用前 `{trailing_pivot_window}` 根已收线 K 的 down pivot，也就是最低 low。
-        6. 空单 trailing stop 使用前 `{trailing_pivot_window}` 根已收线 K 的 up pivot，也就是最高 high。
-        7. 多单如果 close 跌破 down pivot，按 `trailing_pivot` 平剩余仓位。
-        8. 空单如果 close 涨破 up pivot，按 `trailing_pivot` 平剩余仓位。
+        3. 后端启动 Binance Kline WebSocket，订阅当前持仓 symbol 的 `<symbol>@kline_{trailing_kline_interval}`。
+        4. TP1/固定止损使用实时 Kline 更新里的 high/low 判断；只有 `k.x=true` 的已收线 K 会参与 pivot 计算。
+        5. 多单 raw pivot 使用前 `{trailing_pivot_window}` 根已收线 K 的 down pivot，也就是最低 low。
+        6. 空单 raw pivot 使用前 `{trailing_pivot_window}` 根已收线 K 的 up pivot，也就是最高 high。
+        7. trailing stop 只向有利方向移动：多单只上移，空单只下移，不会因为新的 raw pivot 变差而放宽止损。
+        8. 多单如果 close 跌破 trailing stop，按 `trailing_pivot` 平剩余仓位。
+        9. 空单如果 close 涨破 trailing stop，按 `trailing_pivot` 平剩余仓位。
         """
     )
 

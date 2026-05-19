@@ -81,6 +81,110 @@ def test_records_signal_check_log(tmp_path) -> None:
     assert row["price_change_pct"] == 2.1
 
 
+def test_kline_high_low_triggers_take_profit_and_stop_loss(tmp_path) -> None:
+    storage = SQLiteStorage(f"sqlite:///{tmp_path / 'events.sqlite3'}")
+    context = SignalContext(
+        symbol="TESTUSDT",
+        direction=Direction.LONG,
+        timestamp_ms=1_700_000_000_000,
+        trigger_price=100.0,
+        price_change_pct=2.0,
+        window_seconds=60,
+        quote_volume_usdt=100_000,
+        average_quote_volume_usdt=30_000,
+        volume_ratio=3.0,
+        taker_buy_ratio=0.65,
+        taker_sell_ratio=0.35,
+        open_interest=1_000_000,
+        open_interest_value_usdt=2_000_000,
+        oi_delta_pct=0.05,
+        oi_delta_value_usdt=25_000,
+        oi_value_to_volume_ratio=0.25,
+        spread_pct=None,
+        estimated_slippage_pct=None,
+        score=90.0,
+    )
+    signal_id = storage.record_signal(context, risk_allowed=True, risk_reason="allowed", raw={})
+    engine = PaperExecutionEngine(
+        storage,
+        risk_config={"initial_equity_usdt": 10_000},
+        execution_config={"probe_position_fraction": 0.2},
+        exit_config={
+            "stop_loss_pct": 0.01,
+            "take_profit_pct": 0.02,
+            "max_hold_seconds": 900,
+            "scale_out_enabled": False,
+        },
+    )
+    position_id = engine.open_probe_position(signal_id, context)
+
+    engine.update_position_kline(
+        KlineClosed(
+            symbol="TESTUSDT",
+            interval="1m",
+            open_time_ms=1_700_000_000_000,
+            close_time_ms=1_700_000_059_999,
+            open=100.0,
+            high=102.1,
+            low=100.0,
+            close=100.5,
+            is_closed=False,
+        )
+    )
+
+    with storage.connect() as conn:
+        row = conn.execute("SELECT status, exit_reason, exit_price FROM paper_positions WHERE id = ?", (position_id,)).fetchone()
+
+    assert row["status"] == "closed"
+    assert row["exit_reason"] == "take_profit"
+    assert row["exit_price"] == 102.0
+
+    stop_context = SignalContext(
+        symbol="STOPUSDT",
+        direction=Direction.LONG,
+        timestamp_ms=1_700_000_000_000,
+        trigger_price=100.0,
+        price_change_pct=2.0,
+        window_seconds=60,
+        quote_volume_usdt=100_000,
+        average_quote_volume_usdt=30_000,
+        volume_ratio=3.0,
+        taker_buy_ratio=0.65,
+        taker_sell_ratio=0.35,
+        open_interest=1_000_000,
+        open_interest_value_usdt=2_000_000,
+        oi_delta_pct=0.05,
+        oi_delta_value_usdt=25_000,
+        oi_value_to_volume_ratio=0.25,
+        spread_pct=None,
+        estimated_slippage_pct=None,
+        score=90.0,
+    )
+    stop_signal_id = storage.record_signal(stop_context, risk_allowed=True, risk_reason="allowed", raw={})
+    stop_position_id = engine.open_probe_position(stop_signal_id, stop_context)
+
+    engine.update_position_kline(
+        KlineClosed(
+            symbol="STOPUSDT",
+            interval="1m",
+            open_time_ms=1_700_000_000_000,
+            close_time_ms=1_700_000_059_999,
+            open=100.0,
+            high=100.5,
+            low=98.9,
+            close=100.2,
+            is_closed=False,
+        )
+    )
+
+    with storage.connect() as conn:
+        row = conn.execute("SELECT status, exit_reason, exit_price FROM paper_positions WHERE id = ?", (stop_position_id,)).fetchone()
+
+    assert row["status"] == "closed"
+    assert row["exit_reason"] == "stop_loss"
+    assert row["exit_price"] == 99.0
+
+
 def test_scale_out_then_trailing_pivot_close(tmp_path) -> None:
     storage = SQLiteStorage(f"sqlite:///{tmp_path / 'events.sqlite3'}")
     context = SignalContext(
@@ -125,13 +229,25 @@ def test_scale_out_then_trailing_pivot_close(tmp_path) -> None:
     )
     position_id = engine.open_probe_position(signal_id, context)
 
-    engine.update_open_positions("TESTUSDT", 102.0, 1_700_000_010_000)
+    engine.update_position_kline(
+        KlineClosed(
+            symbol="TESTUSDT",
+            interval="1m",
+            open_time_ms=1_700_000_000_000,
+            close_time_ms=1_700_000_010_000,
+            open=100.0,
+            high=102.0,
+            low=100.0,
+            close=101.5,
+            is_closed=False,
+        )
+    )
     position = storage.get_open_positions()[0]
     assert position.id == position_id
     assert position.trailing_active is True
     assert position.remaining_notional_usdt == 1_000
 
-    for index in range(5):
+    for index in range(6):
         engine.update_closed_kline(
             KlineClosed(
                 symbol="TESTUSDT",
@@ -166,3 +282,106 @@ def test_scale_out_then_trailing_pivot_close(tmp_path) -> None:
     assert row["status"] == "closed"
     assert row["exit_reason"] == "trailing_pivot"
     assert row["take_profit_1_pnl_usdt"] > 0
+
+
+def test_long_trailing_stop_only_moves_up(tmp_path) -> None:
+    storage = SQLiteStorage(f"sqlite:///{tmp_path / 'events.sqlite3'}")
+    context = SignalContext(
+        symbol="TESTUSDT",
+        direction=Direction.LONG,
+        timestamp_ms=1_700_000_000_000,
+        trigger_price=100.0,
+        price_change_pct=2.0,
+        window_seconds=60,
+        quote_volume_usdt=100_000,
+        average_quote_volume_usdt=30_000,
+        volume_ratio=3.0,
+        taker_buy_ratio=0.65,
+        taker_sell_ratio=0.35,
+        open_interest=1_000_000,
+        open_interest_value_usdt=2_000_000,
+        oi_delta_pct=0.05,
+        oi_delta_value_usdt=25_000,
+        oi_value_to_volume_ratio=0.25,
+        spread_pct=None,
+        estimated_slippage_pct=None,
+        score=90.0,
+    )
+    signal_id = storage.record_signal(
+        context,
+        risk_allowed=True,
+        risk_reason="allowed",
+        raw={"source": "test"},
+    )
+    engine = PaperExecutionEngine(
+        storage,
+        risk_config={"initial_equity_usdt": 10_000},
+        execution_config={"probe_position_fraction": 0.2},
+        exit_config={
+            "stop_loss_pct": 0.01,
+            "take_profit_pct": 0.02,
+            "max_hold_seconds": 900,
+            "scale_out_enabled": True,
+            "first_take_profit_fraction": 0.5,
+            "trailing_pivot_window": 3,
+        },
+    )
+    position_id = engine.open_probe_position(signal_id, context)
+    engine.update_position_kline(
+        KlineClosed(
+            symbol="TESTUSDT",
+            interval="1m",
+            open_time_ms=1_700_000_000_000,
+            close_time_ms=1_700_000_010_000,
+            open=100.0,
+            high=102.0,
+            low=100.0,
+            close=101.5,
+            is_closed=False,
+        )
+    )
+
+    for index in range(4):
+        engine.update_closed_kline(
+            KlineClosed(
+                symbol="TESTUSDT",
+                interval="1m",
+                open_time_ms=1_700_000_020_000 + index * 60_000,
+                close_time_ms=1_700_000_079_999 + index * 60_000,
+                open=102.0,
+                high=104.0,
+                low=101.0,
+                close=103.0,
+                is_closed=True,
+            )
+        )
+
+    with storage.connect() as conn:
+        row = conn.execute("SELECT trailing_stop_price FROM paper_positions WHERE id = ?", (position_id,)).fetchone()
+    assert row["trailing_stop_price"] == 101.0
+
+    for index in range(4):
+        engine.update_closed_kline(
+            KlineClosed(
+                symbol="TESTUSDT",
+                interval="1m",
+                open_time_ms=1_700_000_260_000 + index * 60_000,
+                close_time_ms=1_700_000_319_999 + index * 60_000,
+                open=102.0,
+                high=103.0,
+                low=95.0,
+                close=102.0,
+                is_closed=True,
+            )
+        )
+
+    with storage.connect() as conn:
+        row = conn.execute(
+            "SELECT status, exit_reason, exit_price, trailing_stop_price FROM paper_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+
+    assert row["status"] == "closed"
+    assert row["exit_reason"] == "trailing_pivot"
+    assert row["trailing_stop_price"] == 101.0
+    assert row["exit_price"] == 101.0
