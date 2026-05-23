@@ -231,6 +231,13 @@ class MarketScanner:
         self._append_tick(state, tick)
         if self.execution.has_open_position(tick.symbol):
             self.storage.record_latest_price(tick.symbol, tick.timestamp_ms, tick.price)
+            if state.pending_candidate is not None:
+                logger.info(
+                    "candidate discarded symbol=%s reason=open_position_active",
+                    tick.symbol,
+                )
+                state.pending_candidate = None
+            return
 
         if state.pending_candidate is not None:
             if tick.timestamp_ms >= state.pending_candidate.evaluate_after_ms:

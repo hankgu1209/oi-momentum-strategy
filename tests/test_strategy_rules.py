@@ -1,7 +1,9 @@
+import asyncio
+
 import pytest
 
 from binance_oi_momentum.execution import PaperExecutionEngine
-from binance_oi_momentum.models import CurrentOpenInterest, Direction, MarketSnapshot, OIContext, PriceTick
+from binance_oi_momentum.models import CurrentOpenInterest, Direction, MarketSnapshot, OIContext, PriceTick, SignalContext
 from binance_oi_momentum.scanner import MarketScanner
 from binance_oi_momentum.storage import SQLiteStorage
 from binance_oi_momentum.strategy import infer_candidate_direction, score_signal
@@ -139,3 +141,107 @@ def test_precheck_reject_records_liquidity_filter_failure(tmp_path) -> None:
 
     assert row["symbol"] == "TESTUSDT"
     assert row["reject_reason"] == "liquidity_filter_failed"
+
+
+def test_handle_tick_ignores_symbol_with_open_position(tmp_path) -> None:
+    storage = SQLiteStorage(f"sqlite:///{tmp_path / 'events.sqlite3'}")
+    config = {
+        "universe": {
+            "min_24h_quote_volume": 0,
+            "max_24h_quote_volume": 500_000_000,
+        },
+        "signal": {
+            "windows_seconds": [60],
+            "primary_window_seconds": 60,
+            "long_return_thresholds": {60: 0.02},
+            "short_return_thresholds": {60: -0.02},
+            "signal_cooldown_seconds": 300,
+        },
+        "risk": {"initial_equity_usdt": 10_000},
+        "execution": {
+            "probe_position_fraction": 0.2,
+            "initial_entry_fraction": 0.3,
+            "scale_in_retrace_fraction": 0.4,
+            "mode": "paper",
+        },
+        "exit": {
+            "stop_loss_pct": 0.01,
+            "take_profit_pct": 0.02,
+            "max_hold_seconds": 900,
+        },
+    }
+    scanner = MarketScanner(
+        client=None,  # type: ignore[arg-type]
+        storage=storage,
+        config=config,
+    )
+    engine = PaperExecutionEngine(
+        storage,
+        risk_config=config["risk"],
+        execution_config=config["execution"],
+        exit_config=config["exit"],
+    )
+    scanner.execution = engine
+    context = SignalContext(
+        symbol="TESTUSDT",
+        direction=Direction.LONG,
+        timestamp_ms=1_700_000_000_000,
+        trigger_price=100.0,
+        price_change_pct=2.0,
+        window_seconds=60,
+        quote_volume_usdt=100_000,
+        average_quote_volume_usdt=30_000,
+        volume_ratio=3.0,
+        taker_buy_ratio=0.65,
+        taker_sell_ratio=0.35,
+        open_interest=1_000_000,
+        open_interest_value_usdt=2_000_000,
+        oi_delta_pct=0.05,
+        oi_delta_value_usdt=25_000,
+        oi_value_to_volume_ratio=0.25,
+        spread_pct=None,
+        estimated_slippage_pct=None,
+        score=90.0,
+        breakout_bar_high=105.0,
+        breakout_bar_low=95.0,
+    )
+    signal_id = storage.record_signal(context, risk_allowed=True, risk_reason="allowed", raw={})
+    engine.open_probe_position(signal_id, context)
+
+    state = scanner.states["TESTUSDT"]
+    scanner._append_tick(
+        state,
+        PriceTick(
+            symbol="TESTUSDT",
+            timestamp_ms=1_700_000_000_000,
+            price=100.0,
+            open_24h=100.0,
+            high_24h=103.0,
+            low_24h=99.0,
+            base_volume_24h=1_000,
+            quote_volume_24h=1_000_000,
+        ),
+    )
+
+    asyncio.run(
+        scanner._handle_tick(
+            PriceTick(
+                symbol="TESTUSDT",
+                timestamp_ms=1_700_000_060_000,
+                price=103.0,
+                open_24h=100.0,
+                high_24h=103.0,
+                low_24h=99.0,
+                base_volume_24h=1_000,
+                quote_volume_24h=1_000_000,
+            )
+        )
+    )
+
+    assert state.pending_candidate is None
+    with storage.connect() as conn:
+        signal_count = conn.execute("SELECT COUNT(*) AS count FROM signals").fetchone()["count"]
+        latest = conn.execute("SELECT price FROM latest_prices WHERE symbol = ?", ("TESTUSDT",)).fetchone()
+
+    assert signal_count == 1
+    assert latest["price"] == 103.0
