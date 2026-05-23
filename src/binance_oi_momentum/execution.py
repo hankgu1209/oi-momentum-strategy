@@ -23,23 +23,44 @@ class PaperExecutionEngine:
         )
 
     def open_probe_position(self, signal_id: int, context: SignalContext) -> int:
-        notional = (
+        total_notional = (
             self.risk_config["initial_equity_usdt"]
             * self.execution_config["probe_position_fraction"]
         )
-        quantity = notional / context.trigger_price
-        stop_loss_pct = self.exit_config["stop_loss_pct"]
+        has_breakout_bar = (
+            context.breakout_bar_high is not None and context.breakout_bar_low is not None
+        )
+        default_initial_fraction = 0.3 if has_breakout_bar else 1.0
+        initial_entry_fraction = float(
+            self.execution_config.get("initial_entry_fraction", default_initial_fraction)
+        )
+        initial_entry_fraction = min(max(initial_entry_fraction, 0.01), 1.0)
+        scale_in_fraction = 1.0 - initial_entry_fraction
+        initial_notional = total_notional * initial_entry_fraction
+        quantity = initial_notional / context.trigger_price if context.trigger_price > 0 else 0.0
         take_profit_pct = self.exit_config["take_profit_pct"]
         scale_out_enabled = bool(self.exit_config.get("scale_out_enabled", False))
         first_take_profit_fraction = float(self.exit_config.get("first_take_profit_fraction", 0.5))
         trailing_pivot_window = int(self.exit_config.get("trailing_pivot_window", 5))
 
         if context.direction == Direction.LONG:
-            stop_loss_price = context.trigger_price * (1 - stop_loss_pct)
+            stop_loss_price = context.breakout_bar_low or context.trigger_price * (
+                1 - self.exit_config["stop_loss_pct"]
+            )
             take_profit_price = context.trigger_price * (1 + take_profit_pct)
+            scale_in_entry_price = context.trigger_price - (
+                context.trigger_price - stop_loss_price
+            ) * float(self.execution_config.get("scale_in_retrace_fraction", 0.4))
         else:
-            stop_loss_price = context.trigger_price * (1 + stop_loss_pct)
+            stop_loss_price = context.breakout_bar_high or context.trigger_price * (
+                1 + self.exit_config["stop_loss_pct"]
+            )
             take_profit_price = context.trigger_price * (1 - take_profit_pct)
+            scale_in_entry_price = context.trigger_price + (
+                stop_loss_price - context.trigger_price
+            ) * float(self.execution_config.get("scale_in_retrace_fraction", 0.4))
+
+        scale_in_pending = scale_in_fraction > 0 and scale_in_entry_price > 0
 
         position = PaperPosition(
             id=None,
@@ -50,12 +71,12 @@ class PaperExecutionEngine:
             entry_time_ms=context.timestamp_ms,
             entry_price=context.trigger_price,
             quantity=quantity,
-            notional_usdt=notional,
+            notional_usdt=initial_notional,
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
             initial_quantity=quantity,
             remaining_quantity=quantity,
-            remaining_notional_usdt=notional,
+            remaining_notional_usdt=initial_notional,
             scale_out_enabled=scale_out_enabled,
             trailing_active=False,
             take_profit_1_price=take_profit_price,
@@ -64,6 +85,9 @@ class PaperExecutionEngine:
             if scale_out_enabled
             else None,
             trailing_pivot_window=trailing_pivot_window,
+            scale_in_pending=scale_in_pending,
+            scale_in_entry_price=scale_in_entry_price if scale_in_pending else None,
+            scale_in_fraction=scale_in_fraction if scale_in_pending else None,
             max_hold_seconds=self.exit_config["max_hold_seconds"],
         )
         return self.storage.open_position(position)
@@ -81,6 +105,10 @@ class PaperExecutionEngine:
                 exit_reason, exit_price = exit_decision
                 self._close_position(position, kline.close_time_ms, exit_price, exit_reason)
                 continue
+
+            if self._should_scale_in_on_kline(position, kline):
+                self._mark_scale_in(position, kline.close_time_ms)
+                position = self.storage.get_position(position.id) or position
 
             if self._should_take_profit_1_on_kline(position, kline):
                 target = position.take_profit_1_price or position.take_profit_price
@@ -151,6 +179,62 @@ class PaperExecutionEngine:
             return "time_exit", kline.close
 
         return None
+
+    @staticmethod
+    def _should_scale_in_on_kline(position: PaperPosition, kline: KlineClosed) -> bool:
+        if not position.scale_in_pending or position.scale_in_entry_price is None:
+            return False
+        if position.trailing_active:
+            return False
+        if position.direction == Direction.LONG:
+            return kline.low <= position.scale_in_entry_price
+        return kline.high >= position.scale_in_entry_price
+
+    def _mark_scale_in(self, position: PaperPosition, timestamp_ms: int) -> None:
+        if position.id is None or position.scale_in_entry_price is None:
+            return
+        filled_fraction = 1.0 - float(position.scale_in_fraction or 0.0)
+        if filled_fraction <= 0:
+            return
+        add_notional = position.notional_usdt * float(position.scale_in_fraction or 0.0) / filled_fraction
+        add_quantity = add_notional / position.scale_in_entry_price
+        new_notional = position.notional_usdt + add_notional
+        new_quantity = position.quantity + add_quantity
+        new_entry_price = new_notional / new_quantity if new_quantity > 0 else position.entry_price
+        take_profit_pct = self.exit_config["take_profit_pct"]
+        if position.direction == Direction.LONG:
+            take_profit_price = new_entry_price * (1 + take_profit_pct)
+        else:
+            take_profit_price = new_entry_price * (1 - take_profit_pct)
+        first_take_profit_quantity = (
+            new_quantity * float(self.exit_config.get("first_take_profit_fraction", 0.5))
+            if position.scale_out_enabled
+            else None
+        )
+        self.storage.mark_scale_in_filled(
+            position.id,
+            timestamp_ms=timestamp_ms,
+            entry_price=new_entry_price,
+            quantity=new_quantity,
+            notional_usdt=new_notional,
+            remaining_quantity=new_quantity,
+            remaining_notional_usdt=new_notional,
+            take_profit_price=take_profit_price,
+            take_profit_1_price=take_profit_price,
+            take_profit_2_price=None if position.scale_out_enabled else take_profit_price,
+            take_profit_1_quantity=first_take_profit_quantity,
+        )
+        logger.info(
+            "paper position scale-in filled position_id=%s symbol=%s direction=%s "
+            "price=%.8g entry=%.8g quantity=%.8g notional=%.4f",
+            position.id,
+            position.symbol,
+            position.direction.value,
+            position.scale_in_entry_price,
+            new_entry_price,
+            new_quantity,
+            new_notional,
+        )
 
     def _should_take_profit_1_on_kline(self, position: PaperPosition, kline: KlineClosed) -> bool:
         if not position.scale_out_enabled or position.trailing_active:

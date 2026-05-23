@@ -634,6 +634,8 @@ class MarketScanner:
             spread_pct=None,
             estimated_slippage_pct=None,
             score=score,
+            breakout_bar_high=kline.high,
+            breakout_bar_low=kline.low,
         )
         log["passed"] = True
         log["reject_reason"] = ""

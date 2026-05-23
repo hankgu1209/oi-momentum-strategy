@@ -43,6 +43,8 @@ class SignalContext:
     spread_pct: float | None
     estimated_slippage_pct: float | None
     score: float
+    breakout_bar_high: float | None = None
+    breakout_bar_low: float | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +155,10 @@ class PaperPosition:
     take_profit_1_pnl_pct: float | None = None
     trailing_stop_price: float | None = None
     trailing_pivot_window: int | None = None
+    scale_in_pending: bool = False
+    scale_in_entry_price: float | None = None
+    scale_in_fraction: float | None = None
+    scale_in_time_ms: int | None = None
     exit_time_ms: int | None = None
     exit_price: float | None = None
     exit_reason: str | None = None

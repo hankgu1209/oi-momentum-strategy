@@ -123,7 +123,9 @@ For each low-liquidity USDT perpetual symbol, the scanner:
 - Fetches realtime `/fapi/v1/openInterest` for current OI qty and `/futures/data/openInterestHist` for the latest 5m snapshot baseline.
 - Requires `(current OI qty - latest 5m snapshot OI qty) / latest 5m snapshot OI qty` to meet the configured threshold.
 - Records every candidate check in the dashboard `Log` tab, including price change, Kline volume, taker buy/sell ratio, OI change, score, and reject reason.
-- Records every accepted signal and opens a paper position using the closed 1m candle close as entry price.
+- Records every accepted signal and opens the first 30% of the paper position at the closed 1m candle close.
+- Leaves the remaining 70% as a paper scale-in order at a 40% retracement from entry toward the breakout bar stop level.
+- Uses the breakout bar low as the stop loss for longs and the breakout bar high as the stop loss for shorts.
 - After a paper position opens, subscribes to that symbol's Kline WebSocket and uses high/low touch logic for stop loss and take profit fills, similar to resting stop/limit orders.
 - If scale-out take profit is enabled, TP1 closes the configured fraction of the paper position, then the remainder uses a Binance Kline WebSocket stream for trailing pivot exits.
 - Long trailing stop uses the down pivot from the previous `N` closed Klines and only moves upward; short trailing stop uses the up pivot from the previous `N` closed Klines and only moves downward.

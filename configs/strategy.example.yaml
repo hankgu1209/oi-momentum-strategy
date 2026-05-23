@@ -48,6 +48,8 @@ signal:
 execution:
   mode: "research"
   probe_position_fraction: 0.20
+  initial_entry_fraction: 0.30
+  scale_in_retrace_fraction: 0.40
   first_add_position_fraction: 0.40
   second_add_position_fraction: 0.40
   max_position_fraction: 1.00

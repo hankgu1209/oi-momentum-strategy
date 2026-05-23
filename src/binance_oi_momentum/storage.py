@@ -93,6 +93,10 @@ class SQLiteStorage:
                     take_profit_1_pnl_pct REAL,
                     trailing_stop_price REAL,
                     trailing_pivot_window INTEGER,
+                    scale_in_pending INTEGER NOT NULL DEFAULT 0,
+                    scale_in_entry_price REAL,
+                    scale_in_fraction REAL,
+                    scale_in_time_ms INTEGER,
                     max_hold_seconds INTEGER NOT NULL,
                     exit_time_ms INTEGER,
                     exit_price REAL,
@@ -173,6 +177,10 @@ class SQLiteStorage:
             self._ensure_column(conn, "paper_positions", "take_profit_1_pnl_pct", "REAL")
             self._ensure_column(conn, "paper_positions", "trailing_stop_price", "REAL")
             self._ensure_column(conn, "paper_positions", "trailing_pivot_window", "INTEGER")
+            self._ensure_column(conn, "paper_positions", "scale_in_pending", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "paper_positions", "scale_in_entry_price", "REAL")
+            self._ensure_column(conn, "paper_positions", "scale_in_fraction", "REAL")
+            self._ensure_column(conn, "paper_positions", "scale_in_time_ms", "INTEGER")
             conn.execute(
                 """
                 UPDATE paper_positions
@@ -345,9 +353,11 @@ class SQLiteStorage:
                     quantity, notional_usdt, stop_loss_price, take_profit_price,
                     initial_quantity, remaining_quantity, remaining_notional_usdt,
                     scale_out_enabled, trailing_active, take_profit_1_price,
-                    take_profit_2_price, trailing_pivot_window, max_hold_seconds
+                    take_profit_2_price, trailing_pivot_window, scale_in_pending,
+                    scale_in_entry_price, scale_in_fraction, scale_in_time_ms,
+                    max_hold_seconds
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     position.signal_id,
@@ -368,10 +378,65 @@ class SQLiteStorage:
                     position.take_profit_1_price,
                     position.take_profit_2_price,
                     position.trailing_pivot_window,
+                    int(position.scale_in_pending),
+                    position.scale_in_entry_price,
+                    position.scale_in_fraction,
+                    position.scale_in_time_ms,
                     position.max_hold_seconds,
                 ),
             )
             return int(cursor.lastrowid)
+
+    def mark_scale_in_filled(
+        self,
+        position_id: int,
+        *,
+        timestamp_ms: int,
+        entry_price: float,
+        quantity: float,
+        notional_usdt: float,
+        remaining_quantity: float,
+        remaining_notional_usdt: float,
+        take_profit_price: float,
+        take_profit_1_price: float,
+        take_profit_2_price: float | None,
+        take_profit_1_quantity: float | None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET
+                    entry_price = ?,
+                    quantity = ?,
+                    notional_usdt = ?,
+                    initial_quantity = ?,
+                    remaining_quantity = ?,
+                    remaining_notional_usdt = ?,
+                    take_profit_price = ?,
+                    take_profit_1_price = ?,
+                    take_profit_2_price = ?,
+                    take_profit_1_quantity = ?,
+                    scale_in_pending = 0,
+                    scale_in_time_ms = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    entry_price,
+                    quantity,
+                    notional_usdt,
+                    quantity,
+                    remaining_quantity,
+                    remaining_notional_usdt,
+                    take_profit_price,
+                    take_profit_1_price,
+                    take_profit_2_price,
+                    take_profit_1_quantity,
+                    timestamp_ms,
+                    position_id,
+                    PositionStatus.OPEN.value,
+                ),
+            )
 
     def mark_first_take_profit(
         self,
@@ -472,6 +537,16 @@ class SQLiteStorage:
             ).fetchall()
         return [self._row_to_position(row) for row in rows]
 
+    def get_position(self, position_id: int | None) -> PaperPosition | None:
+        if position_id is None:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM paper_positions WHERE id = ?",
+                (position_id,),
+            ).fetchone()
+        return None if row is None else self._row_to_position(row)
+
     def count_open_positions(self, direction: Direction | None = None) -> int:
         query = "SELECT COUNT(*) AS count FROM paper_positions WHERE status = ?"
         params: list[Any] = [PositionStatus.OPEN.value]
@@ -543,6 +618,10 @@ class SQLiteStorage:
                 p.scale_out_enabled,
                 p.trailing_active,
                 p.trailing_pivot_window,
+                p.scale_in_pending,
+                p.scale_in_entry_price,
+                p.scale_in_fraction,
+                p.scale_in_time_ms,
                 p.notional_usdt,
                 p.quantity,
                 p.initial_quantity,
@@ -603,6 +682,10 @@ class SQLiteStorage:
             take_profit_1_pnl_pct=row["take_profit_1_pnl_pct"],
             trailing_stop_price=row["trailing_stop_price"],
             trailing_pivot_window=row["trailing_pivot_window"],
+            scale_in_pending=bool(row["scale_in_pending"]),
+            scale_in_entry_price=row["scale_in_entry_price"],
+            scale_in_fraction=row["scale_in_fraction"],
+            scale_in_time_ms=row["scale_in_time_ms"],
             exit_time_ms=row["exit_time_ms"],
             exit_price=row["exit_price"],
             exit_reason=row["exit_reason"],

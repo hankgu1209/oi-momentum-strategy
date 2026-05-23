@@ -312,14 +312,31 @@ def render_config_editor(config_path: str, config) -> None:
             step=0.01,
             help="纸面开仓使用初始权益的比例。0.20 表示 20%。",
         )
-        risk["initial_equity_usdt"] = c2.number_input(
+        execution["initial_entry_fraction"] = c2.number_input(
+            "Initial entry fraction",
+            min_value=0.01,
+            max_value=1.0,
+            value=float(execution.get("initial_entry_fraction", 0.3)),
+            step=0.05,
+            help="信号确认后立即入场的仓位比例。0.30 表示先入 30%，剩余挂回撤单。",
+        )
+        execution["scale_in_retrace_fraction"] = c3.number_input(
+            "Scale-in retrace fraction",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(execution.get("scale_in_retrace_fraction", 0.4)),
+            step=0.05,
+            help="剩余仓位等待从 entry 到突破 bar 止损位之间回撤多少比例再入场。0.40 表示回撤 40%。",
+        )
+        c1, c2, c3 = st.columns(3)
+        risk["initial_equity_usdt"] = c1.number_input(
             "Initial equity USDT",
             min_value=0.0,
             value=float(risk["initial_equity_usdt"]),
             step=100.0,
             help="纸面交易初始权益，用于计算仓位名义金额和日亏损限制。",
         )
-        risk["max_daily_loss"] = c3.number_input(
+        risk["max_daily_loss"] = c2.number_input(
             "Max daily loss",
             min_value=0.0,
             max_value=1.0,
@@ -650,9 +667,10 @@ def render_strategy_logic(config) -> None:
         f"""
         纸面仓位按入场价和初始权益计算名义金额，不发送真实订单。固定止损始终有效。
 
-        - Entry price: 有效 signal 的收线 K close
+        - Initial entry: 有效 signal 的收线 K close，先入 `{execution.get("initial_entry_fraction", 0.3) * 100:.0f}%`
+        - Scale-in entry: 剩余仓位等待价格从 entry 向突破 bar 止损位回撤 `{execution.get("scale_in_retrace_fraction", 0.4) * 100:.0f}%`
         - Notional: `initial_equity * probe_position_fraction`
-        - Stop loss: `{exit_config["stop_loss_pct"] * 100:.2f}%`
+        - Stop loss: 多单用突破 bar low，空单用突破 bar high
         - Take profit target: `{exit_config["take_profit_pct"] * 100:.2f}%`
         - Max hold: `{exit_config["max_hold_seconds"]}` seconds
         - Scale out enabled: `{exit_config.get("scale_out_enabled", False)}`
