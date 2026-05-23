@@ -159,6 +159,10 @@ class PaperPosition:
     scale_in_entry_price: float | None = None
     scale_in_fraction: float | None = None
     scale_in_time_ms: int | None = None
+    entry_price_1: float | None = None
+    notional_1_usdt: float | None = None
+    entry_price_2: float | None = None
+    notional_2_usdt: float | None = None
     exit_time_ms: int | None = None
     exit_price: float | None = None
     exit_reason: str | None = None

@@ -238,6 +238,10 @@ def test_scaled_entry_uses_breakout_bar_stop_and_retrace_fill(tmp_path) -> None:
     assert row["stop_loss_price"] == 95.0
     assert row["scale_in_pending"] == 1
     assert row["scale_in_entry_price"] == 98.0
+    assert row["entry_price_1"] == 100.0
+    assert row["notional_1_usdt"] == 600.0
+    assert row["entry_price_2"] == 98.0
+    assert row["notional_2_usdt"] == 1400.0
 
     engine.update_position_kline(
         KlineClosed(
@@ -264,6 +268,75 @@ def test_scaled_entry_uses_breakout_bar_stop_and_retrace_fill(tmp_path) -> None:
     assert row["quantity"] == pytest.approx(expected_quantity)
     assert row["entry_price"] == pytest.approx(expected_entry)
     assert row["take_profit_price"] == pytest.approx(expected_entry * 1.02)
+
+
+def test_first_take_profit_cancels_pending_scale_in(tmp_path) -> None:
+    storage = SQLiteStorage(f"sqlite:///{tmp_path / 'events.sqlite3'}")
+    context = SignalContext(
+        symbol="TESTUSDT",
+        direction=Direction.LONG,
+        timestamp_ms=1_700_000_000_000,
+        trigger_price=100.0,
+        price_change_pct=2.0,
+        window_seconds=60,
+        quote_volume_usdt=100_000,
+        average_quote_volume_usdt=30_000,
+        volume_ratio=3.0,
+        taker_buy_ratio=0.65,
+        taker_sell_ratio=0.35,
+        open_interest=1_000_000,
+        open_interest_value_usdt=2_000_000,
+        oi_delta_pct=0.05,
+        oi_delta_value_usdt=25_000,
+        oi_value_to_volume_ratio=0.25,
+        spread_pct=None,
+        estimated_slippage_pct=None,
+        score=90.0,
+        breakout_bar_high=105.0,
+        breakout_bar_low=95.0,
+    )
+    signal_id = storage.record_signal(context, risk_allowed=True, risk_reason="allowed", raw={})
+    engine = PaperExecutionEngine(
+        storage,
+        risk_config={"initial_equity_usdt": 10_000},
+        execution_config={
+            "probe_position_fraction": 0.2,
+            "initial_entry_fraction": 0.3,
+            "scale_in_retrace_fraction": 0.4,
+        },
+        exit_config={
+            "stop_loss_pct": 0.01,
+            "take_profit_pct": 0.02,
+            "max_hold_seconds": 900,
+            "scale_out_enabled": True,
+            "first_take_profit_fraction": 0.5,
+            "trailing_pivot_window": 5,
+        },
+    )
+    position_id = engine.open_probe_position(signal_id, context)
+
+    engine.update_position_kline(
+        KlineClosed(
+            symbol="TESTUSDT",
+            interval="1m",
+            open_time_ms=1_700_000_000_000,
+            close_time_ms=1_700_000_059_999,
+            open=100.0,
+            high=102.0,
+            low=99.0,
+            close=101.0,
+            is_closed=False,
+        )
+    )
+
+    with storage.connect() as conn:
+        row = conn.execute("SELECT * FROM paper_positions WHERE id = ?", (position_id,)).fetchone()
+
+    assert row["trailing_active"] == 1
+    assert row["scale_in_pending"] == 0
+    assert row["scale_in_time_ms"] is None
+    assert row["entry_price_2"] == 98.0
+    assert row["notional_2_usdt"] == 1400.0
 
 
 def test_scale_out_then_trailing_pivot_close(tmp_path) -> None:

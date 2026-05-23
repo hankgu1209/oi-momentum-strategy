@@ -790,6 +790,7 @@ def render_dashboard(
     positions = format_time_column(positions, "entry_time_ms")
     positions = format_time_column(positions, "exit_time_ms")
     positions = format_time_column(positions, "take_profit_1_time_ms")
+    positions = format_time_column(positions, "scale_in_time_ms")
 
     signal_columns = [
         "created_at",
@@ -819,6 +820,12 @@ def render_dashboard(
         "direction",
         "status",
         "entry_price",
+        "entry_price_1",
+        "notional_1_usdt",
+        "entry_price_2",
+        "notional_2_usdt",
+        "scale_in_pending",
+        "scale_in_time",
         "exit_price",
         "stop_loss_price",
         "take_profit_price",

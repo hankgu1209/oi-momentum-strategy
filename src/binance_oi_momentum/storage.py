@@ -97,6 +97,10 @@ class SQLiteStorage:
                     scale_in_entry_price REAL,
                     scale_in_fraction REAL,
                     scale_in_time_ms INTEGER,
+                    entry_price_1 REAL,
+                    notional_1_usdt REAL,
+                    entry_price_2 REAL,
+                    notional_2_usdt REAL,
                     max_hold_seconds INTEGER NOT NULL,
                     exit_time_ms INTEGER,
                     exit_price REAL,
@@ -181,6 +185,10 @@ class SQLiteStorage:
             self._ensure_column(conn, "paper_positions", "scale_in_entry_price", "REAL")
             self._ensure_column(conn, "paper_positions", "scale_in_fraction", "REAL")
             self._ensure_column(conn, "paper_positions", "scale_in_time_ms", "INTEGER")
+            self._ensure_column(conn, "paper_positions", "entry_price_1", "REAL")
+            self._ensure_column(conn, "paper_positions", "notional_1_usdt", "REAL")
+            self._ensure_column(conn, "paper_positions", "entry_price_2", "REAL")
+            self._ensure_column(conn, "paper_positions", "notional_2_usdt", "REAL")
             conn.execute(
                 """
                 UPDATE paper_positions
@@ -188,7 +196,9 @@ class SQLiteStorage:
                     initial_quantity = COALESCE(initial_quantity, quantity),
                     remaining_quantity = COALESCE(remaining_quantity, quantity),
                     remaining_notional_usdt = COALESCE(remaining_notional_usdt, notional_usdt),
-                    take_profit_1_price = COALESCE(take_profit_1_price, take_profit_price)
+                    take_profit_1_price = COALESCE(take_profit_1_price, take_profit_price),
+                    entry_price_1 = COALESCE(entry_price_1, entry_price),
+                    notional_1_usdt = COALESCE(notional_1_usdt, notional_usdt)
                 """
             )
             self._ensure_position_journal_view(conn)
@@ -355,9 +365,10 @@ class SQLiteStorage:
                     scale_out_enabled, trailing_active, take_profit_1_price,
                     take_profit_2_price, trailing_pivot_window, scale_in_pending,
                     scale_in_entry_price, scale_in_fraction, scale_in_time_ms,
+                    entry_price_1, notional_1_usdt, entry_price_2, notional_2_usdt,
                     max_hold_seconds
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     position.signal_id,
@@ -382,6 +393,10 @@ class SQLiteStorage:
                     position.scale_in_entry_price,
                     position.scale_in_fraction,
                     position.scale_in_time_ms,
+                    position.entry_price_1,
+                    position.notional_1_usdt,
+                    position.entry_price_2,
+                    position.notional_2_usdt,
                     position.max_hold_seconds,
                 ),
             )
@@ -464,7 +479,8 @@ class SQLiteStorage:
                     take_profit_1_pnl_pct = ?,
                     remaining_quantity = ?,
                     remaining_notional_usdt = ?,
-                    trailing_stop_price = ?
+                    trailing_stop_price = ?,
+                    scale_in_pending = 0
                 WHERE id = ? AND status = ?
                 """,
                 (
@@ -622,6 +638,10 @@ class SQLiteStorage:
                 p.scale_in_entry_price,
                 p.scale_in_fraction,
                 p.scale_in_time_ms,
+                p.entry_price_1,
+                p.notional_1_usdt,
+                p.entry_price_2,
+                p.notional_2_usdt,
                 p.notional_usdt,
                 p.quantity,
                 p.initial_quantity,
@@ -686,6 +706,10 @@ class SQLiteStorage:
             scale_in_entry_price=row["scale_in_entry_price"],
             scale_in_fraction=row["scale_in_fraction"],
             scale_in_time_ms=row["scale_in_time_ms"],
+            entry_price_1=row["entry_price_1"],
+            notional_1_usdt=row["notional_1_usdt"],
+            entry_price_2=row["entry_price_2"],
+            notional_2_usdt=row["notional_2_usdt"],
             exit_time_ms=row["exit_time_ms"],
             exit_price=row["exit_price"],
             exit_reason=row["exit_reason"],

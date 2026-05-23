@@ -37,6 +37,7 @@ class PaperExecutionEngine:
         initial_entry_fraction = min(max(initial_entry_fraction, 0.01), 1.0)
         scale_in_fraction = 1.0 - initial_entry_fraction
         initial_notional = total_notional * initial_entry_fraction
+        scale_in_notional = total_notional * scale_in_fraction
         quantity = initial_notional / context.trigger_price if context.trigger_price > 0 else 0.0
         take_profit_pct = self.exit_config["take_profit_pct"]
         scale_out_enabled = bool(self.exit_config.get("scale_out_enabled", False))
@@ -88,6 +89,10 @@ class PaperExecutionEngine:
             scale_in_pending=scale_in_pending,
             scale_in_entry_price=scale_in_entry_price if scale_in_pending else None,
             scale_in_fraction=scale_in_fraction if scale_in_pending else None,
+            entry_price_1=context.trigger_price,
+            notional_1_usdt=initial_notional,
+            entry_price_2=scale_in_entry_price if scale_in_pending else None,
+            notional_2_usdt=scale_in_notional if scale_in_pending else None,
             max_hold_seconds=self.exit_config["max_hold_seconds"],
         )
         return self.storage.open_position(position)
@@ -196,7 +201,11 @@ class PaperExecutionEngine:
         filled_fraction = 1.0 - float(position.scale_in_fraction or 0.0)
         if filled_fraction <= 0:
             return
-        add_notional = position.notional_usdt * float(position.scale_in_fraction or 0.0) / filled_fraction
+        add_notional = (
+            position.notional_2_usdt
+            if position.notional_2_usdt is not None
+            else position.notional_usdt * float(position.scale_in_fraction or 0.0) / filled_fraction
+        )
         add_quantity = add_notional / position.scale_in_entry_price
         new_notional = position.notional_usdt + add_notional
         new_quantity = position.quantity + add_quantity
