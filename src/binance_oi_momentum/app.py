@@ -344,6 +344,15 @@ def render_config_editor(config_path: str, config) -> None:
             step=0.005,
             help="每日最大已实现亏损比例。触发后新信号不再开仓。",
         )
+        risk["account_risk_per_trade"] = c3.number_input(
+            "Account risk per trade",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(risk.get("account_risk_per_trade", 0.003)),
+            step=0.001,
+            format="%.4f",
+            help="按实际止损距离反推最大仓位。0.003 表示单笔计划风险不超过账户 0.3%。",
+        )
         c1, c2 = st.columns(2)
         risk["max_simultaneous_positions"] = c1.number_input(
             "Max simultaneous positions",
@@ -654,6 +663,7 @@ def render_strategy_logic(config) -> None:
 
         - Initial equity: `{risk["initial_equity_usdt"]:,.0f}` USDT
         - Probe position fraction: `{execution["probe_position_fraction"]:.2f}`
+        - Account risk per trade: `{risk.get("account_risk_per_trade", 0) * 100:.2f}%`
         - Max simultaneous positions: `{risk["max_simultaneous_positions"]}`
         - Max same direction positions: `{risk["max_same_direction_positions"]}`
         - Max daily loss: `{risk["max_daily_loss"] * 100:.2f}%`
@@ -669,7 +679,7 @@ def render_strategy_logic(config) -> None:
 
         - Initial entry: 有效 signal 的收线 K close，先入 `{execution.get("initial_entry_fraction", 0.3) * 100:.0f}%`
         - Scale-in entry: 剩余仓位等待价格从 entry 向突破 bar 止损位回撤 `{execution.get("scale_in_retrace_fraction", 0.4) * 100:.0f}%`
-        - Notional: `initial_equity * probe_position_fraction`
+        - Notional: 先按 `initial_equity * probe_position_fraction` 作为上限，再按实际止损距离限制到 `account_risk_per_trade`
         - Stop loss: 多单用突破 bar low，空单用突破 bar high
         - Take profit target: `{exit_config["take_profit_pct"] * 100:.2f}%`
         - Max hold: `{exit_config["max_hold_seconds"]}` seconds

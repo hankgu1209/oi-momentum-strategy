@@ -23,10 +23,6 @@ class PaperExecutionEngine:
         )
 
     def open_probe_position(self, signal_id: int, context: SignalContext) -> int:
-        total_notional = (
-            self.risk_config["initial_equity_usdt"]
-            * self.execution_config["probe_position_fraction"]
-        )
         has_breakout_bar = (
             context.breakout_bar_high is not None and context.breakout_bar_low is not None
         )
@@ -36,9 +32,6 @@ class PaperExecutionEngine:
         )
         initial_entry_fraction = min(max(initial_entry_fraction, 0.01), 1.0)
         scale_in_fraction = 1.0 - initial_entry_fraction
-        initial_notional = total_notional * initial_entry_fraction
-        scale_in_notional = total_notional * scale_in_fraction
-        quantity = initial_notional / context.trigger_price if context.trigger_price > 0 else 0.0
         take_profit_pct = self.exit_config["take_profit_pct"]
         scale_out_enabled = bool(self.exit_config.get("scale_out_enabled", False))
         first_take_profit_fraction = float(self.exit_config.get("first_take_profit_fraction", 0.5))
@@ -62,6 +55,16 @@ class PaperExecutionEngine:
             ) * float(self.execution_config.get("scale_in_retrace_fraction", 0.4))
 
         scale_in_pending = scale_in_fraction > 0 and scale_in_entry_price > 0
+        total_notional = self._risk_capped_notional(
+            entry_price=context.trigger_price,
+            stop_loss_price=stop_loss_price,
+            initial_entry_fraction=initial_entry_fraction,
+            scale_in_entry_price=scale_in_entry_price if scale_in_pending else None,
+            scale_in_fraction=scale_in_fraction if scale_in_pending else 0.0,
+        )
+        initial_notional = total_notional * initial_entry_fraction
+        scale_in_notional = total_notional * scale_in_fraction
+        quantity = initial_notional / context.trigger_price if context.trigger_price > 0 else 0.0
 
         position = PaperPosition(
             id=None,
@@ -96,6 +99,41 @@ class PaperExecutionEngine:
             max_hold_seconds=self.exit_config["max_hold_seconds"],
         )
         return self.storage.open_position(position)
+
+    def _risk_capped_notional(
+        self,
+        *,
+        entry_price: float,
+        stop_loss_price: float,
+        initial_entry_fraction: float,
+        scale_in_entry_price: float | None,
+        scale_in_fraction: float,
+    ) -> float:
+        initial_equity = float(self.risk_config["initial_equity_usdt"])
+        max_notional = initial_equity * float(self.execution_config["probe_position_fraction"])
+        risk_fraction = float(self.risk_config.get("account_risk_per_trade", 0.0))
+        if initial_equity <= 0 or risk_fraction <= 0:
+            return max_notional
+
+        weighted_stop_loss_pct = (
+            initial_entry_fraction * self._price_distance_pct(entry_price, stop_loss_price)
+        )
+        if scale_in_entry_price is not None and scale_in_fraction > 0:
+            weighted_stop_loss_pct += scale_in_fraction * self._price_distance_pct(
+                scale_in_entry_price,
+                stop_loss_price,
+            )
+        if weighted_stop_loss_pct <= 0:
+            return max_notional
+
+        risk_budget = initial_equity * risk_fraction
+        return min(max_notional, risk_budget / weighted_stop_loss_pct)
+
+    @staticmethod
+    def _price_distance_pct(entry_price: float, stop_loss_price: float) -> float:
+        if entry_price <= 0:
+            return 0.0
+        return abs(entry_price - stop_loss_price) / entry_price
 
     def has_open_position(self, symbol: str) -> bool:
         return any(position.symbol == symbol for position in self.storage.get_open_positions())

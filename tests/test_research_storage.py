@@ -270,6 +270,59 @@ def test_scaled_entry_uses_breakout_bar_stop_and_retrace_fill(tmp_path) -> None:
     assert row["take_profit_price"] == pytest.approx(expected_entry * 1.02)
 
 
+def test_position_notional_is_capped_by_account_risk_per_trade(tmp_path) -> None:
+    storage = SQLiteStorage(f"sqlite:///{tmp_path / 'events.sqlite3'}")
+    context = SignalContext(
+        symbol="TESTUSDT",
+        direction=Direction.LONG,
+        timestamp_ms=1_700_000_000_000,
+        trigger_price=100.0,
+        price_change_pct=2.0,
+        window_seconds=60,
+        quote_volume_usdt=100_000,
+        average_quote_volume_usdt=30_000,
+        volume_ratio=3.0,
+        taker_buy_ratio=0.65,
+        taker_sell_ratio=0.35,
+        open_interest=1_000_000,
+        open_interest_value_usdt=2_000_000,
+        oi_delta_pct=0.05,
+        oi_delta_value_usdt=25_000,
+        oi_value_to_volume_ratio=0.25,
+        spread_pct=None,
+        estimated_slippage_pct=None,
+        score=90.0,
+        breakout_bar_high=105.0,
+        breakout_bar_low=90.0,
+    )
+    signal_id = storage.record_signal(context, risk_allowed=True, risk_reason="allowed", raw={})
+    engine = PaperExecutionEngine(
+        storage,
+        risk_config={"initial_equity_usdt": 10_000, "account_risk_per_trade": 0.003},
+        execution_config={
+            "probe_position_fraction": 0.2,
+            "initial_entry_fraction": 0.3,
+            "scale_in_retrace_fraction": 0.4,
+        },
+        exit_config={
+            "stop_loss_pct": 0.01,
+            "take_profit_pct": 0.02,
+            "max_hold_seconds": 900,
+            "scale_out_enabled": False,
+        },
+    )
+    position_id = engine.open_probe_position(signal_id, context)
+
+    with storage.connect() as conn:
+        row = conn.execute("SELECT * FROM paper_positions WHERE id = ?", (position_id,)).fetchone()
+
+    weighted_stop_loss_pct = 0.3 * ((100 - 90) / 100) + 0.7 * ((96 - 90) / 96)
+    expected_total_notional = 30 / weighted_stop_loss_pct
+    assert row["notional_1_usdt"] == pytest.approx(expected_total_notional * 0.3)
+    assert row["notional_2_usdt"] == pytest.approx(expected_total_notional * 0.7)
+    assert row["notional_1_usdt"] + row["notional_2_usdt"] < 2000.0
+
+
 def test_first_take_profit_cancels_pending_scale_in(tmp_path) -> None:
     storage = SQLiteStorage(f"sqlite:///{tmp_path / 'events.sqlite3'}")
     context = SignalContext(
