@@ -115,17 +115,19 @@ For each low-liquidity USDT perpetual symbol, the scanner:
 - Does not trade immediately after the candidate appears.
 - Waits for the current 1m candle to close, then fetches `/fapi/v1/continuousKlines`.
 - Requires the latest closed 1m quote volume to be at least `2x` the average quote volume of the previous 30 one-minute candles.
-- Requires the closed 1m candle close to be near the directional extreme:
-  - long: `(high - close) / high <= 0.1%`
-  - short: `(close - low) / low <= 0.1%`
+- Requires the closed 1m candle close to be strong relative to the candle open and directional extreme:
+  - long: `(close - open) / (high - open) >= 0.90`
+  - short: `(open - close) / (open - low) >= 0.90`
+  - The long and short minimum close strengths are configurable.
 - Requires taker buy quote volume ratio >= 60% for longs.
 - Requires taker sell quote volume ratio >= 60% for shorts.
 - Fetches realtime `/fapi/v1/openInterest` for current OI qty and `/futures/data/openInterestHist` for the latest 5m snapshot baseline.
-- Requires `(current OI qty - latest 5m snapshot OI qty) / latest 5m snapshot OI qty` to meet the configured threshold.
-- Records every candidate check in the dashboard `Log` tab, including price change, Kline volume, taker buy/sell ratio, OI change, score, and reject reason.
+- Requires current OI qty to be greater than the latest 5m snapshot OI qty, then requires the OI increase percentage to meet the configured threshold.
+- Records every candidate check in the dashboard `Log` tab, including price change, Kline volume, taker buy/sell ratio, previous OI, current OI, OI change, score, and reject reason.
 - Records every accepted signal and opens the first 30% of the paper position at the closed 1m candle close.
 - Leaves the remaining 70% as a paper scale-in order at a 40% retracement from entry toward the breakout bar stop level.
 - Uses the breakout bar low as the stop loss for longs and the breakout bar high as the stop loss for shorts.
+- Sets the take-profit target by R multiple when `first_take_profit_r` is configured, so TP follows the actual entry-to-stop distance instead of a fixed percentage.
 - Caps total paper notional by the configured account risk per trade and the actual stop distance, so wide breakout bars automatically get smaller positions.
 - After a paper position opens, subscribes to that symbol's Kline WebSocket and uses high/low touch logic for stop loss and take profit fills, similar to resting stop/limit orders.
 - If scale-out take profit is enabled, TP1 closes the configured fraction of the paper position, then the remainder uses a Binance Kline WebSocket stream for trailing pivot exits.

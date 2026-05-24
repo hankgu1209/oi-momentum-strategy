@@ -32,7 +32,6 @@ class PaperExecutionEngine:
         )
         initial_entry_fraction = min(max(initial_entry_fraction, 0.01), 1.0)
         scale_in_fraction = 1.0 - initial_entry_fraction
-        take_profit_pct = self.exit_config["take_profit_pct"]
         scale_out_enabled = bool(self.exit_config.get("scale_out_enabled", False))
         first_take_profit_fraction = float(self.exit_config.get("first_take_profit_fraction", 0.5))
         trailing_pivot_window = int(self.exit_config.get("trailing_pivot_window", 5))
@@ -41,7 +40,6 @@ class PaperExecutionEngine:
             stop_loss_price = context.breakout_bar_low or context.trigger_price * (
                 1 - self.exit_config["stop_loss_pct"]
             )
-            take_profit_price = context.trigger_price * (1 + take_profit_pct)
             scale_in_entry_price = context.trigger_price - (
                 context.trigger_price - stop_loss_price
             ) * float(self.execution_config.get("scale_in_retrace_fraction", 0.4))
@@ -49,7 +47,6 @@ class PaperExecutionEngine:
             stop_loss_price = context.breakout_bar_high or context.trigger_price * (
                 1 + self.exit_config["stop_loss_pct"]
             )
-            take_profit_price = context.trigger_price * (1 - take_profit_pct)
             scale_in_entry_price = context.trigger_price + (
                 stop_loss_price - context.trigger_price
             ) * float(self.execution_config.get("scale_in_retrace_fraction", 0.4))
@@ -65,6 +62,11 @@ class PaperExecutionEngine:
         initial_notional = total_notional * initial_entry_fraction
         scale_in_notional = total_notional * scale_in_fraction
         quantity = initial_notional / context.trigger_price if context.trigger_price > 0 else 0.0
+        take_profit_price = self._take_profit_price(
+            entry_price=context.trigger_price,
+            stop_loss_price=stop_loss_price,
+            direction=context.direction,
+        )
 
         position = PaperPosition(
             id=None,
@@ -134,6 +136,29 @@ class PaperExecutionEngine:
         if entry_price <= 0:
             return 0.0
         return abs(entry_price - stop_loss_price) / entry_price
+
+    def _take_profit_price(
+        self,
+        *,
+        entry_price: float,
+        stop_loss_price: float,
+        direction: Direction,
+    ) -> float:
+        take_profit_r = self.exit_config.get("take_profit_r")
+        if take_profit_r is None:
+            take_profit_r = self.exit_config.get("first_take_profit_r")
+        if take_profit_r is not None:
+            risk_distance = abs(entry_price - stop_loss_price)
+            if risk_distance > 0:
+                r_multiple = max(float(take_profit_r), 0.0)
+                if direction == Direction.LONG:
+                    return entry_price + risk_distance * r_multiple
+                return entry_price - risk_distance * r_multiple
+
+        take_profit_pct = self.exit_config["take_profit_pct"]
+        if direction == Direction.LONG:
+            return entry_price * (1 + take_profit_pct)
+        return entry_price * (1 - take_profit_pct)
 
     def has_open_position(self, symbol: str) -> bool:
         return any(position.symbol == symbol for position in self.storage.get_open_positions())
@@ -248,11 +273,11 @@ class PaperExecutionEngine:
         new_notional = position.notional_usdt + add_notional
         new_quantity = position.quantity + add_quantity
         new_entry_price = new_notional / new_quantity if new_quantity > 0 else position.entry_price
-        take_profit_pct = self.exit_config["take_profit_pct"]
-        if position.direction == Direction.LONG:
-            take_profit_price = new_entry_price * (1 + take_profit_pct)
-        else:
-            take_profit_price = new_entry_price * (1 - take_profit_pct)
+        take_profit_price = self._take_profit_price(
+            entry_price=new_entry_price,
+            stop_loss_price=position.stop_loss_price,
+            direction=position.direction,
+        )
         first_take_profit_quantity = (
             new_quantity * float(self.exit_config.get("first_take_profit_fraction", 0.5))
             if position.scale_out_enabled

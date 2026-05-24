@@ -40,22 +40,24 @@ def test_score_penalizes_wide_spread() -> None:
     assert wide_spread_score < clean_score
 
 
-def test_close_position_uses_directional_extreme_distance() -> None:
-    long_distance = MarketScanner._close_position(
+def test_close_position_uses_directional_open_to_extreme_strength() -> None:
+    long_strength = MarketScanner._close_position(
+        open=100,
         low=100,
         high=110,
-        close=109.9,
+        close=109,
         direction=Direction.LONG,
     )
-    short_distance = MarketScanner._close_position(
+    short_strength = MarketScanner._close_position(
+        open=110,
         low=100,
         high=110,
-        close=100.1,
+        close=101,
         direction=Direction.SHORT,
     )
 
-    assert long_distance == pytest.approx((110 - 109.9) / 110)
-    assert short_distance == pytest.approx((100.1 - 100) / 100)
+    assert long_strength == pytest.approx(0.9)
+    assert short_strength == pytest.approx(0.9)
 
 
 def test_realtime_oi_context_compares_current_qty_to_latest_snapshot() -> None:
@@ -76,6 +78,21 @@ def test_realtime_oi_context_compares_current_qty_to_latest_snapshot() -> None:
     assert context.previous_open_interest == 1_000_000
     assert context.delta_pct == pytest.approx(0.05)
     assert context.delta_value_usdt == pytest.approx(100_000)
+    assert MarketScanner._open_interest_increasing(context) is True
+
+
+def test_open_interest_must_increase() -> None:
+    context = OIContext(
+        symbol="TESTUSDT",
+        timestamp_ms=1_700_000_060_000,
+        open_interest=990_000,
+        open_interest_value_usdt=1_980_000,
+        previous_open_interest=1_000_000,
+        previous_open_interest_value_usdt=2_000_000,
+    )
+
+    assert context.delta_pct < 0
+    assert MarketScanner._open_interest_increasing(context) is False
 
 
 def test_precheck_reject_records_liquidity_filter_failure(tmp_path) -> None:

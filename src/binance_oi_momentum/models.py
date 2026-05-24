@@ -43,6 +43,8 @@ class SignalContext:
     spread_pct: float | None
     estimated_slippage_pct: float | None
     score: float
+    previous_open_interest: float | None = None
+    previous_open_interest_value_usdt: float | None = None
     breakout_bar_high: float | None = None
     breakout_bar_low: float | None = None
 

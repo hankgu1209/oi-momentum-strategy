@@ -30,8 +30,8 @@ signal:
   kline_interval: "1m"
   kline_lookback: 30
   kline_close_delay_ms: 1500
-  long_close_distance_max: 0.001
-  short_close_distance_max: 0.001
+  long_close_strength_min: 0.90
+  short_close_strength_min: 0.90
   volume_ratio_min: 2.0
   oi_value_to_volume_ratio_min: 0.1
   taker_buy_ratio_min_for_long: 0.60

@@ -226,33 +226,37 @@ def render_config_editor(config_path: str, config) -> None:
             step=0.1,
             help="最新 1m quote volume / 过去均量。大于该值才认为放量。",
         )
-        long_close_distance_default = signal.get(
-            "long_close_distance_max",
-            max(1.0 - float(signal.get("long_close_position_min", 0.999)), 0.0),
+        long_close_strength_default = signal.get(
+            "long_close_strength_min",
+            signal.get("close_strength_min", signal.get("long_close_position_min", 0.9)),
         )
-        short_close_distance_default = signal.get(
-            "short_close_distance_max",
-            float(signal.get("short_close_position_max", 0.001)),
+        short_close_strength_default = signal.get(
+            "short_close_strength_min",
+            signal.get("close_strength_min", signal.get("short_close_position_min", 0.9)),
         )
         c1, c2 = st.columns(2)
-        signal["long_close_distance_max"] = c1.number_input(
-            "Long close distance max",
+        signal["long_close_strength_min"] = c1.number_input(
+            "Long close strength min",
             min_value=0.0,
-            value=float(long_close_distance_default),
-            step=0.0005,
-            format="%.4f",
-            help="做多时，(high - close) / high 必须不大于该值。0.001 表示 close 距离 high 不超过约 0.1%。",
+            max_value=1.0,
+            value=float(long_close_strength_default),
+            step=0.01,
+            format="%.2f",
+            help="做多时，(close - open) / (high - open) 必须不小于该值。0.90 表示 close 收在 open 到 high 区间的 90% 以上。",
         )
-        signal["short_close_distance_max"] = c2.number_input(
-            "Short close distance max",
+        signal["short_close_strength_min"] = c2.number_input(
+            "Short close strength min",
             min_value=0.0,
-            value=float(short_close_distance_default),
-            step=0.0005,
-            format="%.4f",
-            help="做空时，(close - low) / low 必须不大于该值。0.001 表示 close 距离 low 不超过约 0.1%。",
+            max_value=1.0,
+            value=float(short_close_strength_default),
+            step=0.01,
+            format="%.2f",
+            help="做空时，(open - close) / (open - low) 必须不小于该值。0.90 表示 close 收在 open 到 low 区间的 90% 以上。",
         )
         signal.pop("long_close_position_min", None)
         signal.pop("short_close_position_max", None)
+        signal.pop("long_close_distance_max", None)
+        signal.pop("short_close_distance_max", None)
 
         st.subheader("Flow And OI")
         c1, c2, c3 = st.columns(3)
@@ -379,13 +383,13 @@ def render_config_editor(config_path: str, config) -> None:
             format="%.4f",
             help="固定止损百分比。0.012 表示 1.2%。",
         )
-        exit_config["take_profit_pct"] = c2.number_input(
-            "Take profit pct",
+        exit_config["first_take_profit_r"] = c2.number_input(
+            "TP1 R multiple",
             min_value=0.0,
-            value=float(exit_config["take_profit_pct"]),
-            step=0.001,
-            format="%.4f",
-            help="固定止盈百分比。0.018 表示 1.8%，即止损 1.2% 时盈亏比 1:1.5。",
+            value=float(exit_config.get("first_take_profit_r", 0.8)),
+            step=0.1,
+            format="%.2f",
+            help="按实际止损距离计算 TP1。0.8 表示 TP1 在 0.8R；如果未配置 R，后端才使用 take_profit_pct 兜底。",
         )
         exit_config["max_hold_seconds"] = c3.number_input(
             "Max hold seconds",
@@ -492,13 +496,13 @@ def render_strategy_logic(config) -> None:
         primary_window,
         signal["short_return_thresholds"].get(str(primary_window), -0.02),
     )
-    long_close_distance_max = signal.get(
-        "long_close_distance_max",
-        max(1.0 - float(signal.get("long_close_position_min", 0.999)), 0.0),
+    long_close_strength_min = signal.get(
+        "long_close_strength_min",
+        signal.get("close_strength_min", signal.get("long_close_position_min", 0.9)),
     )
-    short_close_distance_max = signal.get(
-        "short_close_distance_max",
-        float(signal.get("short_close_position_max", 0.001)),
+    short_close_strength_min = signal.get(
+        "short_close_strength_min",
+        signal.get("close_strength_min", signal.get("short_close_position_min", 0.9)),
     )
     scale_out_enabled = bool(exit_config.get("scale_out_enabled", False))
     first_take_profit_fraction = float(exit_config.get("first_take_profit_fraction", 0.5))
@@ -605,8 +609,8 @@ def render_strategy_logic(config) -> None:
         f"""
         候选触发后，最新收线 K 需要证明趋势没有明显回落。这里不用 high-low 区间百分位，而是计算 close 距离方向极值的比例。
 
-        - 做多 close 强度：`(high - close) / high <= {long_close_distance_max * 100:.3f}%`
-        - 做空 close 强度：`(close - low) / low <= {short_close_distance_max * 100:.3f}%`
+        - 做多 close 强度：`(close - open) / (high - open) >= {long_close_strength_min:.2f}`
+        - 做空 close 强度：`(open - close) / (open - low) >= {short_close_strength_min:.2f}`
         - 成交额放大：`latest_quote_volume / average_quote_volume >= {signal["volume_ratio_min"]:.2f}`
         - 均量窗口：过去 `{signal["kline_lookback"]}` 根已收线 `{signal["kline_interval"]}` K
         """
@@ -681,7 +685,7 @@ def render_strategy_logic(config) -> None:
         - Scale-in entry: 剩余仓位等待价格从 entry 向突破 bar 止损位回撤 `{execution.get("scale_in_retrace_fraction", 0.4) * 100:.0f}%`
         - Notional: 先按 `initial_equity * probe_position_fraction` 作为上限，再按实际止损距离限制到 `account_risk_per_trade`
         - Stop loss: 多单用突破 bar low，空单用突破 bar high
-        - Take profit target: `{exit_config["take_profit_pct"] * 100:.2f}%`
+        - Take profit target: `{exit_config.get("first_take_profit_r", 0):.2f}R`，按 entry 到 stop 的实际距离计算
         - Max hold: `{exit_config["max_hold_seconds"]}` seconds
         - Scale out enabled: `{exit_config.get("scale_out_enabled", False)}`
         - TP1 close fraction: `{exit_config.get("first_take_profit_fraction", 0.5):.2f}`
@@ -720,11 +724,12 @@ def render_strategy_logic(config) -> None:
 
         - `missing_kline_data`: K线数据不足或请求为空
         - `missing_open_interest_data`: OI 数据为空
-        - `long_close_too_far_from_high`: 做多收盘价离 high 太远
-        - `short_close_too_far_from_low`: 做空收盘价离 low 太远
+        - `long_close_not_strong_enough`: 做多 close 没有收在 open 到 high 区间足够高的位置
+        - `short_close_not_strong_enough`: 做空 close 没有收在 open 到 low 区间足够低的位置
         - `liquidity_filter_failed`: 价格阈值已触发，但 24h quote volume 不在 universe 流动性范围内
         - `signal_cooldown_active`: 价格阈值已触发，但该 symbol 仍在信号冷却期
         - `volume_ratio_below_min`: 成交额放大倍数不足
+        - `open_interest_not_increasing`: 当前 OI 没有高于最近 5m 快照 OI
         - `oi_delta_pct_below_min`: OI 增幅不足
         - `oi_value_to_volume_below_min`: OI value 增量相对成交额不足
         - `taker_buy_ratio_below_min`: 做多主动买入占比不足
@@ -743,7 +748,9 @@ def render_strategy_logic(config) -> None:
         - `average_quote_volume_usdt`: 过去 30 根 1m K 线的平均 quote volume
         - `volume_ratio`: 最新 1m K 线成交额相对过去 30 分钟平均成交额的倍数
         - `taker_buy_ratio` / `taker_sell_ratio`: 最新 1m K 线主动买入/主动卖出 quote volume 占比
+        - `previous_open_interest`: 最近 5m OI 快照 qty
         - `open_interest`: 触发时实时 `/fapi/v1/openInterest` OI qty
+        - `previous_open_interest_value_usdt`: 最近 5m OI 快照 qty * 收线价估算值
         - `open_interest_value_usdt`: 实时 OI qty * 收线价估算值
         - `oi_delta_pct`: 实时 OI qty 相对最近 5m 快照 OI qty 的增幅
         - `oi_delta_value_usdt`: OI qty 增量 * 收线价的估算 USDT 增量
@@ -814,7 +821,9 @@ def render_dashboard(
         "volume_ratio",
         "taker_buy_ratio",
         "taker_sell_ratio",
+        "previous_open_interest",
         "open_interest",
+        "previous_open_interest_value_usdt",
         "open_interest_value_usdt",
         "oi_delta_pct",
         "oi_delta_value_usdt",
@@ -856,6 +865,7 @@ def render_dashboard(
         "take_profit_1_quantity",
         "take_profit_1_pnl_usdt",
         "signal_price_change_pct",
+        "signal_previous_open_interest",
         "signal_open_interest",
         "signal_oi_delta_pct",
         "signal_quote_volume_usdt",
@@ -942,6 +952,7 @@ def render_signal_log(signal_checks: pd.DataFrame, signal_check_stats: pd.DataFr
         "open_interest",
         "previous_open_interest",
         "open_interest_value_usdt",
+        "previous_open_interest_value_usdt",
         "oi_delta_pct",
         "oi_delta_value_usdt",
         "oi_value_to_volume_ratio",
@@ -1225,7 +1236,9 @@ def main() -> None:
             s.volume_ratio AS signal_volume_ratio,
             s.taker_buy_ratio AS signal_taker_buy_ratio,
             s.taker_sell_ratio AS signal_taker_sell_ratio,
+            s.previous_open_interest AS signal_previous_open_interest,
             s.open_interest AS signal_open_interest,
+            s.previous_open_interest_value_usdt AS signal_previous_open_interest_value_usdt,
             s.open_interest_value_usdt AS signal_open_interest_value_usdt,
             s.oi_delta_pct AS signal_oi_delta_pct,
             s.oi_delta_value_usdt AS signal_oi_delta_value_usdt

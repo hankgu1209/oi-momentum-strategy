@@ -52,7 +52,9 @@ class SQLiteStorage:
                     taker_buy_ratio REAL NOT NULL,
                     taker_sell_ratio REAL NOT NULL DEFAULT 0,
                     open_interest REAL NOT NULL DEFAULT 0,
+                    previous_open_interest REAL,
                     open_interest_value_usdt REAL NOT NULL DEFAULT 0,
+                    previous_open_interest_value_usdt REAL,
                     oi_delta_pct REAL NOT NULL,
                     oi_delta_value_usdt REAL NOT NULL,
                     oi_value_to_volume_ratio REAL NOT NULL,
@@ -147,6 +149,7 @@ class SQLiteStorage:
                     open_interest REAL,
                     previous_open_interest REAL,
                     open_interest_value_usdt REAL,
+                    previous_open_interest_value_usdt REAL,
                     oi_delta_pct REAL,
                     oi_delta_value_usdt REAL,
                     oi_value_to_volume_ratio REAL,
@@ -166,7 +169,10 @@ class SQLiteStorage:
             self._ensure_column(conn, "signals", "average_quote_volume_usdt", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(conn, "signals", "taker_sell_ratio", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(conn, "signals", "open_interest", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "signals", "previous_open_interest", "REAL")
             self._ensure_column(conn, "signals", "open_interest_value_usdt", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "signals", "previous_open_interest_value_usdt", "REAL")
+            self._ensure_column(conn, "signal_checks", "previous_open_interest_value_usdt", "REAL")
             self._ensure_column(conn, "paper_positions", "initial_quantity", "REAL")
             self._ensure_column(conn, "paper_positions", "remaining_quantity", "REAL")
             self._ensure_column(conn, "paper_positions", "remaining_notional_usdt", "REAL")
@@ -222,6 +228,7 @@ class SQLiteStorage:
             "open_interest": log.get("open_interest"),
             "previous_open_interest": log.get("previous_open_interest"),
             "open_interest_value_usdt": log.get("open_interest_value_usdt"),
+            "previous_open_interest_value_usdt": log.get("previous_open_interest_value_usdt"),
             "oi_delta_pct": log.get("oi_delta_pct"),
             "oi_delta_value_usdt": log.get("oi_delta_value_usdt"),
             "oi_value_to_volume_ratio": log.get("oi_value_to_volume_ratio"),
@@ -240,11 +247,12 @@ class SQLiteStorage:
                     trigger_price, price_change_pct, quote_volume_usdt,
                     average_quote_volume_usdt, volume_ratio, taker_buy_ratio,
                     taker_sell_ratio, open_interest, previous_open_interest,
-                    open_interest_value_usdt, oi_delta_pct, oi_delta_value_usdt,
-                    oi_value_to_volume_ratio, close_position, score, passed,
+                    open_interest_value_usdt, previous_open_interest_value_usdt,
+                    oi_delta_pct, oi_delta_value_usdt, oi_value_to_volume_ratio,
+                    close_position, score, passed,
                     reject_reason, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["checked_at_ms"],
@@ -264,6 +272,7 @@ class SQLiteStorage:
                     payload["open_interest"],
                     payload["previous_open_interest"],
                     payload["open_interest_value_usdt"],
+                    payload["previous_open_interest_value_usdt"],
                     payload["oi_delta_pct"],
                     payload["oi_delta_value_usdt"],
                     payload["oi_value_to_volume_ratio"],
@@ -324,10 +333,12 @@ class SQLiteStorage:
                     created_at_ms, symbol, direction, trigger_price, price_change_pct,
                     window_seconds, quote_volume_usdt, average_quote_volume_usdt,
                     volume_ratio, taker_buy_ratio, taker_sell_ratio, open_interest,
-                    open_interest_value_usdt, oi_delta_pct, oi_delta_value_usdt,
-                    oi_value_to_volume_ratio, score, risk_allowed, risk_reason, raw_json
+                    previous_open_interest, open_interest_value_usdt,
+                    previous_open_interest_value_usdt, oi_delta_pct,
+                    oi_delta_value_usdt, oi_value_to_volume_ratio, score,
+                    risk_allowed, risk_reason, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     context.timestamp_ms,
@@ -342,7 +353,9 @@ class SQLiteStorage:
                     context.taker_buy_ratio,
                     context.taker_sell_ratio,
                     context.open_interest,
+                    context.previous_open_interest,
                     context.open_interest_value_usdt,
+                    context.previous_open_interest_value_usdt,
                     context.oi_delta_pct,
                     context.oi_delta_value_usdt,
                     context.oi_value_to_volume_ratio,
@@ -658,7 +671,9 @@ class SQLiteStorage:
                 s.volume_ratio AS entry_signal_volume_ratio,
                 s.taker_buy_ratio AS entry_signal_taker_buy_ratio,
                 s.taker_sell_ratio AS entry_signal_taker_sell_ratio,
+                s.previous_open_interest AS entry_signal_previous_open_interest,
                 s.open_interest AS entry_signal_open_interest,
+                s.previous_open_interest_value_usdt AS entry_signal_previous_open_interest_value_usdt,
                 s.open_interest_value_usdt AS entry_signal_open_interest_value_usdt,
                 s.oi_delta_pct AS entry_signal_oi_delta_pct,
                 s.oi_delta_value_usdt AS entry_signal_oi_delta_value_usdt,

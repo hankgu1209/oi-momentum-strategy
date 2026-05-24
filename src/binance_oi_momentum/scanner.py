@@ -574,6 +574,7 @@ class MarketScanner:
                 "open_interest": oi.open_interest,
                 "previous_open_interest": oi.previous_open_interest,
                 "open_interest_value_usdt": oi.open_interest_value_usdt,
+                "previous_open_interest_value_usdt": oi.previous_open_interest_value_usdt,
                 "oi_delta_pct": oi.delta_pct,
                 "oi_delta_value_usdt": oi.delta_value_usdt,
             }
@@ -582,6 +583,7 @@ class MarketScanner:
             return self._rejected_signal_evaluation(log, "zero_kline_quote_volume")
 
         close_position = self._close_position(
+            open=kline.open,
             low=kline.low,
             high=kline.high,
             close=kline.close,
@@ -591,12 +593,15 @@ class MarketScanner:
         if close_position is None:
             return self._rejected_signal_evaluation(log, "invalid_candle_range")
         if pending.direction == Direction.LONG:
-            if close_position > self._long_close_distance_max():
-                return self._rejected_signal_evaluation(log, "long_close_too_far_from_high")
-        elif close_position > self._short_close_distance_max():
-            return self._rejected_signal_evaluation(log, "short_close_too_far_from_low")
+            if close_position < self._long_close_strength_min():
+                return self._rejected_signal_evaluation(log, "long_close_not_strong_enough")
+        elif close_position < self._short_close_strength_min():
+            return self._rejected_signal_evaluation(log, "short_close_not_strong_enough")
 
-        oi_value_to_volume_ratio = max(oi.delta_value_usdt, 0.0) / kline.quote_volume_usdt
+        if not self._open_interest_increasing(oi):
+            return self._rejected_signal_evaluation(log, "open_interest_not_increasing")
+
+        oi_value_to_volume_ratio = oi.delta_value_usdt / kline.quote_volume_usdt
         log["oi_value_to_volume_ratio"] = oi_value_to_volume_ratio
         score = score_signal(
             direction=pending.direction,
@@ -634,7 +639,9 @@ class MarketScanner:
             taker_buy_ratio=kline.taker_buy_ratio,
             taker_sell_ratio=kline.taker_sell_ratio,
             open_interest=oi.open_interest,
+            previous_open_interest=oi.previous_open_interest,
             open_interest_value_usdt=oi.open_interest_value_usdt,
+            previous_open_interest_value_usdt=oi.previous_open_interest_value_usdt,
             oi_delta_pct=oi.delta_pct,
             oi_delta_value_usdt=oi.delta_value_usdt,
             oi_value_to_volume_ratio=oi_value_to_volume_ratio,
@@ -722,6 +729,10 @@ class MarketScanner:
         )
 
     @staticmethod
+    def _open_interest_increasing(oi: OIContext) -> bool:
+        return oi.previous_open_interest is not None and oi.open_interest > oi.previous_open_interest
+
+    @staticmethod
     def _return_for_window(snapshot: MarketSnapshot, window_seconds: int) -> float | None:
         if window_seconds == 10:
             return snapshot.return_10s
@@ -731,31 +742,50 @@ class MarketScanner:
             return snapshot.return_60s
         return None
 
-    def _long_close_distance_max(self) -> float:
+    def _long_close_strength_min(self) -> float:
         signal_config = self.config["signal"]
+        if "long_close_strength_min" in signal_config:
+            return float(signal_config["long_close_strength_min"])
+        if "close_strength_min" in signal_config:
+            return float(signal_config["close_strength_min"])
+        if "long_close_position_min" in signal_config:
+            return float(signal_config["long_close_position_min"])
         if "long_close_distance_max" in signal_config:
-            return float(signal_config["long_close_distance_max"])
-        return max(1.0 - float(signal_config.get("long_close_position_min", 0.999)), 0.0)
+            return max(1.0 - float(signal_config["long_close_distance_max"]), 0.0)
+        return 0.9
 
-    def _short_close_distance_max(self) -> float:
+    def _short_close_strength_min(self) -> float:
         signal_config = self.config["signal"]
+        if "short_close_strength_min" in signal_config:
+            return float(signal_config["short_close_strength_min"])
+        if "close_strength_min" in signal_config:
+            return float(signal_config["close_strength_min"])
+        if "short_close_position_min" in signal_config:
+            return float(signal_config["short_close_position_min"])
         if "short_close_distance_max" in signal_config:
-            return float(signal_config["short_close_distance_max"])
-        return float(signal_config.get("short_close_position_max", 0.001))
+            return max(1.0 - float(signal_config["short_close_distance_max"]), 0.0)
+        if "short_close_position_max" in signal_config:
+            return max(1.0 - float(signal_config["short_close_position_max"]), 0.0)
+        return 0.9
 
     @staticmethod
     def _close_position(
         *,
+        open: float,
         low: float,
         high: float,
         close: float,
         direction: Direction,
     ) -> float | None:
-        if low <= 0 or high <= 0:
+        if low <= 0 or high <= 0 or open <= 0:
             return None
         if direction == Direction.LONG:
-            return max((high - close) / high, 0.0)
-        return max((close - low) / low, 0.0)
+            if high <= open:
+                return None
+            return min(max((close - open) / (high - open), 0.0), 1.0)
+        if low >= open:
+            return None
+        return min(max((open - close) / (open - low), 0.0), 1.0)
 
     @staticmethod
     def _oldest_tick_at_or_before(state: SymbolState, timestamp_ms: int) -> PriceTick | None:
