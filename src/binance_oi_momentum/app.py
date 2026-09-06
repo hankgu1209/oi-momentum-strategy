@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import sqlite3
 import time
 import logging
@@ -24,6 +25,16 @@ DEFAULT_CONFIG = os.getenv(
     os.getenv("OI_MOMENTUM_CONFIG", "configs/strategy.local.yaml"),
 )
 DEFAULT_LIVE_CONFIG = os.getenv("OI_MOMENTUM_LIVE_CONFIG", "configs/strategy.live.yaml")
+KLINE_INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"]
+KLINE_INTERVAL_MS = {
+    "1m": 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "1h": 60 * 60_000,
+    "4h": 4 * 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
+}
+MAX_POSITION_CHART_KLINES = 5_000
 configure_logging("dashboard")
 logger = logging.getLogger(__name__)
 
@@ -125,36 +136,62 @@ def fetch_continuous_klines(
     *,
     interval: str = "1m",
     limit: int = 120,
+    start_time_ms: int | None = None,
+    end_time_ms: int | None = None,
 ) -> pd.DataFrame:
-    response = requests.get(
-        f"{rest_base_url.rstrip('/')}/fapi/v1/continuousKlines",
-        params={
+    columns = [
+        "open_time_ms",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time_ms",
+        "quote_volume_usdt",
+        "number_of_trades",
+        "taker_buy_volume",
+        "taker_buy_quote_volume_usdt",
+        "ignore",
+    ]
+    url = f"{rest_base_url.rstrip('/')}/fapi/v1/continuousKlines"
+    request_limit = max(1, min(int(limit), 1500))
+    all_rows = []
+    next_start_time_ms = start_time_ms
+
+    while True:
+        params = {
             "pair": symbol,
             "contractType": "PERPETUAL",
             "interval": interval,
-            "limit": limit,
-        },
-        timeout=15,
-    )
-    response.raise_for_status()
-    rows = response.json()
-    frame = pd.DataFrame(
-        rows,
-        columns=[
-            "open_time_ms",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time_ms",
-            "quote_volume_usdt",
-            "number_of_trades",
-            "taker_buy_volume",
-            "taker_buy_quote_volume_usdt",
-            "ignore",
-        ],
-    )
+            "limit": request_limit,
+        }
+        if next_start_time_ms is not None:
+            params["startTime"] = next_start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        rows = response.json()
+        if not rows:
+            break
+
+        all_rows.extend(rows)
+        if start_time_ms is None or end_time_ms is None:
+            break
+        if len(all_rows) >= limit:
+            break
+
+        last_open_time_ms = int(rows[-1][0])
+        next_start_time_ms = last_open_time_ms + KLINE_INTERVAL_MS.get(interval, 60_000)
+        if next_start_time_ms > end_time_ms or next_start_time_ms <= last_open_time_ms:
+            break
+
+    frame = pd.DataFrame(all_rows[:limit], columns=columns)
+    if frame.empty:
+        return frame
+
+    frame = frame.drop_duplicates("open_time_ms").sort_values("open_time_ms")
     numeric_columns = [
         "open",
         "high",
@@ -172,6 +209,35 @@ def fetch_continuous_klines(
         frame["quote_volume_usdt"] - frame["taker_buy_quote_volume_usdt"]
     ).clip(lower=0)
     return frame
+
+
+def utc_datetime_from_ms(timestamp_ms: int) -> dt.datetime:
+    return dt.datetime.fromtimestamp(timestamp_ms / 1000, tz=dt.timezone.utc).replace(
+        microsecond=0
+    )
+
+
+def utc_ms_from_inputs(date_value: dt.date, time_value: dt.time) -> int:
+    value = dt.datetime.combine(date_value, time_value, tzinfo=dt.timezone.utc)
+    return int(value.timestamp() * 1000)
+
+
+def position_time_ms(position: pd.Series, column: str) -> int | None:
+    value = position.get(column)
+    if pd.isna(value):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def suggested_kline_interval(start_time_ms: int, end_time_ms: int) -> str:
+    span_ms = max(end_time_ms - start_time_ms, 0)
+    for interval in KLINE_INTERVALS:
+        if span_ms / KLINE_INTERVAL_MS[interval] <= 1200:
+            return interval
+    return "1d"
 
 
 def add_unrealized_pnl(positions: pd.DataFrame) -> pd.DataFrame:
@@ -1170,6 +1236,7 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
 
     selected_label = st.selectbox("Position", labels)
     position = positions.iloc[labels.index(selected_label)]
+    position_id = int(position["id"])
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Entry", f"{position['entry_price']:g}")
@@ -1177,15 +1244,99 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
     c3.metric("TP1", f"{position.get('take_profit_1_price', position['take_profit_price']):g}")
     c4.metric("Unrealized", f"{position.get('unrealized_pnl_usdt', 0):.2f} USDT")
 
+    entry_time_ms = position_time_ms(position, "entry_time_ms") or int(time.time() * 1000)
+    event_times = [
+        value
+        for value in [
+            entry_time_ms,
+            position_time_ms(position, "exit_time_ms"),
+            position_time_ms(position, "take_profit_1_time_ms"),
+            position_time_ms(position, "scale_in_time_ms"),
+        ]
+        if value is not None
+    ]
+    latest_event_time_ms = max(event_times) if event_times else entry_time_ms
+    if str(position.get("status")) == "open":
+        latest_event_time_ms = max(latest_event_time_ms, int(time.time() * 1000))
+
+    default_start_ms = max(entry_time_ms - 30 * 60_000, 0)
+    default_end_ms = latest_event_time_ms + 30 * 60_000
+    default_interval = suggested_kline_interval(default_start_ms, default_end_ms)
+    default_start = utc_datetime_from_ms(default_start_ms)
+    default_end = utc_datetime_from_ms(default_end_ms)
+
+    control_1, control_2, control_3 = st.columns([1, 1, 1])
+    fetch_klines = control_1.toggle(
+        "Fetch Binance klines",
+        value=True,
+        key=f"chart_fetch_klines_{position_id}",
+    )
+    timeframe = control_2.selectbox(
+        "Timeframe",
+        KLINE_INTERVALS,
+        index=KLINE_INTERVALS.index(default_interval),
+        key=f"chart_timeframe_{position_id}",
+    )
+    if control_3.button("Refresh klines", key=f"chart_refresh_klines_{position_id}"):
+        fetch_continuous_klines.clear()
+
+    start_cols = st.columns(4)
+    start_date = start_cols[0].date_input(
+        "Start date (UTC)",
+        value=default_start.date(),
+        key=f"chart_start_date_{position_id}",
+    )
+    start_time_value = start_cols[1].time_input(
+        "Start time (UTC)",
+        value=default_start.time(),
+        step=60,
+        key=f"chart_start_time_{position_id}",
+    )
+    end_date = start_cols[2].date_input(
+        "End date (UTC)",
+        value=default_end.date(),
+        key=f"chart_end_date_{position_id}",
+    )
+    end_time_value = start_cols[3].time_input(
+        "End time (UTC)",
+        value=default_end.time(),
+        step=60,
+        key=f"chart_end_time_{position_id}",
+    )
+
+    start_time_ms = utc_ms_from_inputs(start_date, start_time_value)
+    end_time_ms = utc_ms_from_inputs(end_date, end_time_value)
+    if end_time_ms <= start_time_ms:
+        st.error("End time must be after start time.")
+        return
+
+    interval_ms = KLINE_INTERVAL_MS[timeframe]
+    requested_candles = int((end_time_ms - start_time_ms) / interval_ms) + 1
+    if requested_candles > MAX_POSITION_CHART_KLINES:
+        st.error(
+            f"Selected range needs about {requested_candles:,} candles. "
+            f"Use a higher timeframe or shorter range; max is {MAX_POSITION_CHART_KLINES:,}."
+        )
+        return
+    if not fetch_klines:
+        st.info("Enable Fetch Binance klines to load the chart.")
+        return
+
     try:
         klines = fetch_continuous_klines(
             config.exchange["rest_base_url"],
             position["symbol"],
-            interval="1m",
-            limit=120,
+            interval=timeframe,
+            limit=requested_candles,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
         )
     except Exception as exc:
         st.error(f"Failed to load kline data: {type(exc).__name__}: {exc}")
+        return
+
+    if klines.empty:
+        st.info("No kline data returned for this range.")
         return
 
     klines = klines.copy()
@@ -1193,11 +1344,18 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
         lambda row: "up" if row["close"] >= row["open"] else "down",
         axis=1,
     )
+    st.caption(
+        f"{position['symbol']} {timeframe} candles: {len(klines):,} "
+        f"from {klines['open_time'].min()} to {klines['open_time'].max()}"
+    )
 
     x_encoding = alt.X(
         "open_time:T",
         title="Time",
-        axis=alt.Axis(format="%H:%M", labelAngle=0),
+        axis=alt.Axis(
+            format="%Y-%m-%d" if timeframe == "1d" else "%m-%d %H:%M",
+            labelAngle=0,
+        ),
     )
     y_encoding = alt.Y("low:Q", title="Price", scale=alt.Scale(zero=False))
     candle_tooltip = [
@@ -1227,7 +1385,7 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
     )
     body_chart = (
         alt.Chart(klines)
-        .mark_bar(size=5)
+        .mark_bar(size=7 if len(klines) <= 300 else 4 if len(klines) <= 1000 else 2)
         .encode(
             x=x_encoding,
             y=alt.Y("open:Q", title="Price", scale=alt.Scale(zero=False)),
@@ -1277,7 +1435,7 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
     point_rows = [
         {
             "event": "Entry",
-            "time": pd.to_datetime(position["entry_time_ms"], unit="ms"),
+            "time": pd.to_datetime(entry_time_ms, unit="ms"),
             "price": position["entry_price"],
         }
     ]
