@@ -5,6 +5,7 @@ import datetime as dt
 import sqlite3
 import time
 import logging
+import math
 import os
 import shutil
 from pathlib import Path
@@ -230,6 +231,50 @@ def position_time_ms(position: pd.Series, column: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def finite_float_or_none(value: object) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def finite_float(value: object, default: float = 0.0) -> float:
+    parsed = finite_float_or_none(value)
+    return default if parsed is None else parsed
+
+
+def position_realized_pnl_usdt(position: pd.Series) -> float:
+    if str(position.get("status") or "unknown") == "closed":
+        return finite_float(position.get("pnl_usdt"))
+
+    stored_tp1_pnl = finite_float_or_none(position.get("take_profit_1_pnl_usdt"))
+    if stored_tp1_pnl is not None:
+        return stored_tp1_pnl
+
+    entry_price = finite_float_or_none(position.get("entry_price"))
+    exit_price = finite_float_or_none(position.get("take_profit_1_exit_price"))
+    if exit_price is None and position_time_ms(position, "take_profit_1_time_ms") is not None:
+        exit_price = finite_float_or_none(position.get("take_profit_1_price"))
+    if entry_price is None or exit_price is None or entry_price <= 0:
+        return 0.0
+
+    exit_quantity = finite_float_or_none(position.get("take_profit_1_quantity"))
+    if exit_quantity is None:
+        notional = finite_float_or_none(position.get("notional_usdt"))
+        remaining_notional = finite_float_or_none(position.get("remaining_notional_usdt"))
+        if notional is not None and remaining_notional is not None and remaining_notional < notional:
+            exit_quantity = (notional - remaining_notional) / entry_price
+    if exit_quantity is None or exit_quantity <= 0:
+        return 0.0
+
+    if str(position.get("direction")) == "short":
+        return (entry_price - exit_price) * exit_quantity
+    return (exit_price - entry_price) * exit_quantity
 
 
 def suggested_kline_interval(start_time_ms: int, end_time_ms: int) -> str:
@@ -1242,19 +1287,8 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
     position_id = int(position["id"])
     position_status = str(position.get("status") or "unknown")
 
-    realized_value = (
-        position.get("pnl_usdt")
-        if position_status == "closed"
-        else position.get("take_profit_1_pnl_usdt")
-    )
-    try:
-        realized_pnl_usdt = float(realized_value or 0)
-    except (TypeError, ValueError):
-        realized_pnl_usdt = 0.0
-    try:
-        unrealized_pnl_usdt = float(position.get("unrealized_pnl_usdt") or 0)
-    except (TypeError, ValueError):
-        unrealized_pnl_usdt = 0.0
+    realized_pnl_usdt = position_realized_pnl_usdt(position)
+    unrealized_pnl_usdt = finite_float(position.get("unrealized_pnl_usdt"))
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Entry", f"{position['entry_price']:g}")
