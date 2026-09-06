@@ -979,6 +979,7 @@ def render_dashboard(
     signals: pd.DataFrame,
     positions: pd.DataFrame,
     live_account: dict | None = None,
+    is_live: bool = False,
 ) -> None:
     now_ms = int(time.time() * 1000)
     heartbeat_age = None
@@ -1042,6 +1043,8 @@ def render_dashboard(
         "score",
         "risk_allowed",
         "risk_reason",
+        "execution_status",
+        "execution_reason",
     ]
     position_columns = [
         "entry_time",
@@ -1095,7 +1098,7 @@ def render_dashboard(
         hide_index=True,
     )
 
-    st.subheader("Paper Positions")
+    st.subheader("Live Positions" if is_live else "Paper Positions")
     st.dataframe(
         positions[[column for column in position_columns if column in positions.columns]],
         width="stretch",
@@ -1633,6 +1636,7 @@ def render_profile_workspace(
             signals=signals,
             positions=positions,
             live_account=live_account,
+            is_live=is_live,
         )
 
     with log_tab:

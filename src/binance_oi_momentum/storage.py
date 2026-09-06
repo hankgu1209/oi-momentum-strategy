@@ -61,6 +61,8 @@ class SQLiteStorage:
                     score REAL NOT NULL,
                     risk_allowed INTEGER NOT NULL,
                     risk_reason TEXT NOT NULL,
+                    execution_status TEXT,
+                    execution_reason TEXT,
                     raw_json TEXT NOT NULL
                 );
 
@@ -172,6 +174,8 @@ class SQLiteStorage:
             self._ensure_column(conn, "signals", "previous_open_interest", "REAL")
             self._ensure_column(conn, "signals", "open_interest_value_usdt", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(conn, "signals", "previous_open_interest_value_usdt", "REAL")
+            self._ensure_column(conn, "signals", "execution_status", "TEXT")
+            self._ensure_column(conn, "signals", "execution_reason", "TEXT")
             self._ensure_column(conn, "signal_checks", "previous_open_interest_value_usdt", "REAL")
             self._ensure_column(conn, "paper_positions", "initial_quantity", "REAL")
             self._ensure_column(conn, "paper_positions", "remaining_quantity", "REAL")
@@ -366,6 +370,23 @@ class SQLiteStorage:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def update_signal_execution(
+        self,
+        signal_id: int,
+        *,
+        execution_status: str,
+        execution_reason: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE signals
+                SET execution_status = ?, execution_reason = ?
+                WHERE id = ?
+                """,
+                (execution_status, execution_reason, signal_id),
+            )
 
     def open_position(self, position: PaperPosition) -> int:
         with self.connect() as conn:
@@ -680,7 +701,9 @@ class SQLiteStorage:
                 s.oi_value_to_volume_ratio AS entry_signal_oi_value_to_volume_ratio,
                 s.score AS entry_signal_score,
                 s.risk_allowed AS entry_signal_risk_allowed,
-                s.risk_reason AS entry_signal_risk_reason
+                s.risk_reason AS entry_signal_risk_reason,
+                s.execution_status AS entry_signal_execution_status,
+                s.execution_reason AS entry_signal_execution_reason
             FROM paper_positions p
             LEFT JOIN signals s ON s.id = p.signal_id;
             """

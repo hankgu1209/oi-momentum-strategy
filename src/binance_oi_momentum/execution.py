@@ -26,6 +26,9 @@ class PaperExecutionEngine:
 
     def open_probe_position(self, signal_id: int, context: SignalContext) -> int:
         plan = self.plan_probe_position(context)
+        return self.record_probe_position(signal_id, context, plan)
+
+    def record_probe_position(self, signal_id: int, context: SignalContext, plan: dict) -> int:
         position = PaperPosition(
             id=None,
             signal_id=signal_id,

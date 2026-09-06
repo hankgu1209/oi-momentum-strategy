@@ -504,9 +504,20 @@ class MarketScanner:
             risk.planned_position_fraction,
         )
 
-        if risk.allowed and self.config["execution"]["mode"] in {"research", "paper"}:
+        if not risk.allowed:
+            self.storage.update_signal_execution(
+                signal_id,
+                execution_status="risk_blocked",
+                execution_reason=risk.reason,
+            )
+        elif self.config["execution"]["mode"] in {"research", "paper"}:
             position_id = self.execution.open_probe_position(signal_id, context)
             self.storage.record_latest_price(context.symbol, context.timestamp_ms, context.trigger_price)
+            self.storage.update_signal_execution(
+                signal_id,
+                execution_status="paper_opened",
+                execution_reason=f"position_id={position_id}",
+            )
             logger.info(
                 "paper position opened position_id=%s signal_id=%s symbol=%s direction=%s entry=%.8g",
                 position_id,
@@ -515,13 +526,25 @@ class MarketScanner:
                 context.direction.value,
                 context.trigger_price,
             )
-        elif risk.allowed and self.config["execution"]["mode"] == "live":
+        elif self.config["execution"]["mode"] == "live":
             if self.live_execution is None:
                 logger.error("live execution unavailable signal_id=%s symbol=%s", signal_id, context.symbol)
+                self.storage.update_signal_execution(
+                    signal_id,
+                    execution_status="live_failed",
+                    execution_reason="live execution unavailable",
+                )
                 return
+            self.storage.update_signal_execution(signal_id, execution_status="live_submitting")
             try:
                 result = await self.live_execution.open_probe_position(signal_id, context)
             except Exception as exc:
+                execution_reason = f"{type(exc).__name__}: {exc}"
+                self.storage.update_signal_execution(
+                    signal_id,
+                    execution_status="live_failed",
+                    execution_reason=execution_reason[:500],
+                )
                 logger.exception(
                     "live order placement failed signal_id=%s symbol=%s error=%s: %s",
                     signal_id,
@@ -530,9 +553,19 @@ class MarketScanner:
                     exc,
                 )
                 return
+            position_id = self.execution.record_probe_position(signal_id, context, result["plan"])
             self.storage.record_latest_price(context.symbol, context.timestamp_ms, context.trigger_price)
+            self.storage.update_signal_execution(
+                signal_id,
+                execution_status="live_submitted",
+                execution_reason=(
+                    f"position_id={position_id} entry_order_id="
+                    f"{result.get('entry_order', {}).get('orderId')}"
+                ),
+            )
             logger.info(
-                "live position entry submitted signal_id=%s symbol=%s entry_order_id=%s",
+                "live position entry submitted position_id=%s signal_id=%s symbol=%s entry_order_id=%s",
+                position_id,
                 signal_id,
                 context.symbol,
                 result.get("entry_order", {}).get("orderId"),
