@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import time
 import logging
@@ -12,6 +13,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from binance_oi_momentum.binance import BinanceFuturesTradingClient
 from binance_oi_momentum.config import load_config, save_config
 from binance_oi_momentum.logging_utils import configure_logging
 from binance_oi_momentum.storage import SQLiteStorage, sqlite_path_from_url
@@ -21,6 +23,24 @@ DEFAULT_CONFIG = os.getenv("OI_MOMENTUM_CONFIG", "configs/strategy.local.yaml")
 DEFAULT_LIVE_CONFIG = os.getenv("OI_MOMENTUM_LIVE_CONFIG", "configs/strategy.live.yaml")
 configure_logging("dashboard")
 logger = logging.getLogger(__name__)
+
+
+def load_dotenv(path: str | Path = ".env") -> None:
+    dotenv_path = Path(path)
+    if not dotenv_path.exists():
+        return
+    for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip("'").strip('"')
+
+
+load_dotenv()
 
 
 @st.cache_data(ttl=3)
@@ -50,11 +70,49 @@ def ensure_profile_config(config_path: str, *, live: bool) -> None:
     if live:
         config["execution"]["mode"] = "live"
         config["execution"]["live_trading_enabled"] = False
+        config["execution"]["hedge_mode"] = True
+        config["risk"]["initial_equity_usdt"] = 500
+        config["risk"]["account_risk_per_trade"] = 0.03
         config["storage"]["database_url"] = "sqlite:///data/events-live.sqlite3"
     else:
         config["execution"]["mode"] = "paper"
         config["execution"]["live_trading_enabled"] = False
     save_config(target, config)
+
+
+def binance_api_credentials() -> tuple[str | None, str | None]:
+    return (
+        os.getenv("BINANCE_API_KEY") or os.getenv("BINANCE_FUTURES_API_KEY") or os.getenv("API_KEY"),
+        os.getenv("BINANCE_API_SECRET")
+        or os.getenv("BINANCE_FUTURES_API_SECRET")
+        or os.getenv("API_SECRET"),
+    )
+
+
+@st.cache_data(ttl=5)
+def fetch_futures_account(
+    rest_base_url: str,
+    request_timeout_seconds: int,
+    recv_window_ms: int,
+) -> dict:
+    api_key, api_secret = binance_api_credentials()
+    if not api_key or not api_secret:
+        return {"error": "missing_api_credentials"}
+
+    async def _fetch() -> dict:
+        client = BinanceFuturesTradingClient(
+            rest_base_url=rest_base_url,
+            api_key=api_key,
+            api_secret=api_secret,
+            request_timeout_seconds=request_timeout_seconds,
+            recv_window_ms=recv_window_ms,
+        )
+        return await client.account()
+
+    try:
+        return asyncio.run(_fetch())
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 @st.cache_data(ttl=30)
@@ -851,6 +909,7 @@ def render_dashboard(
     heartbeat: pd.DataFrame,
     signals: pd.DataFrame,
     positions: pd.DataFrame,
+    live_account: dict | None = None,
 ) -> None:
     now_ms = int(time.time() * 1000)
     heartbeat_age = None
@@ -876,6 +935,9 @@ def render_dashboard(
     c4.metric("Open positions", len(open_positions))
     c5.metric("Unrealized PnL", f"{unrealized_pnl:.2f} USDT")
     c6.metric("Realized PnL", f"{realized_pnl:.2f} USDT", f"{win_rate:.1f}% win")
+
+    if live_account is not None:
+        render_live_account_monitor(live_account)
 
     if not closed_positions.empty:
         curve = closed_positions.sort_values("exit_time_ms").copy()
@@ -970,6 +1032,50 @@ def render_dashboard(
         width="stretch",
         hide_index=True,
     )
+
+
+def render_live_account_monitor(account: dict) -> None:
+    st.subheader("Live Account")
+    if account.get("error"):
+        st.error(f"Failed to load Binance account: {account['error']}")
+        return
+
+    def as_float(key: str) -> float:
+        value = account.get(key, 0)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Wallet balance", f"{as_float('totalWalletBalance'):.2f} USDT")
+    c2.metric("Margin balance", f"{as_float('totalMarginBalance'):.2f} USDT")
+    c3.metric("Unrealized PnL", f"{as_float('totalUnrealizedProfit'):.2f} USDT")
+    c4.metric("Available balance", f"{as_float('availableBalance'):.2f} USDT")
+
+    rows = []
+    for position in account.get("positions", []):
+        try:
+            amount = float(position.get("positionAmt", 0))
+            unrealized = float(position.get("unrealizedProfit", 0))
+        except (TypeError, ValueError):
+            continue
+        if abs(amount) <= 0 and abs(unrealized) <= 0:
+            continue
+        rows.append(
+            {
+                "symbol": position.get("symbol"),
+                "position_side": position.get("positionSide"),
+                "amount": amount,
+                "entry_price": float(position.get("entryPrice") or 0),
+                "notional": float(position.get("notional") or 0),
+                "unrealized_pnl": unrealized,
+                "leverage": position.get("leverage"),
+                "isolated": position.get("isolated"),
+            }
+        )
+
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def render_signal_log(signal_checks: pd.DataFrame, signal_check_stats: pd.DataFrame, log_limit: int) -> None:
@@ -1336,18 +1442,29 @@ def render_profile_workspace(
     if is_live:
         live_enabled = bool(config.execution.get("live_trading_enabled", False))
         mode = str(config.execution.get("mode", "research"))
+        live_account = fetch_futures_account(
+            config.exchange["rest_base_url"],
+            int(config.exchange.get("request_timeout_seconds", 15)),
+            int(config.exchange.get("recv_window_ms", 5000)),
+        )
         if mode == "live" and live_enabled:
             st.warning("Live mode is armed. The scanner can send real Binance Futures orders.")
         else:
             st.info("Live workspace is not armed. Set mode=live and enable live trading in Config to trade.")
     else:
+        live_account = None
         st.info("Demo workspace uses research/paper data and does not send real orders.")
 
     dashboard_tab, log_tab, chart_tab, logic_tab, config_tab = st.tabs(
         ["Monitor", "Log", "Position Chart", "Strategy Logic", "Config"]
     )
     with dashboard_tab:
-        render_dashboard(heartbeat=heartbeat, signals=signals, positions=positions)
+        render_dashboard(
+            heartbeat=heartbeat,
+            signals=signals,
+            positions=positions,
+            live_account=live_account,
+        )
 
     with log_tab:
         render_signal_log(signal_checks, signal_check_stats, int(log_limit))

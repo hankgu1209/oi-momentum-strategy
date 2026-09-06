@@ -451,6 +451,25 @@ class MarketScanner:
             context.taker_sell_ratio,
             context.score,
         )
+        if self.config["execution"]["mode"] == "live":
+            if self.live_execution is None:
+                logger.error("live execution unavailable before risk gate symbol=%s", context.symbol)
+                return
+            try:
+                margin_balance = await self.live_execution.refresh_margin_equity()
+            except Exception as exc:
+                logger.exception(
+                    "live margin balance refresh failed symbol=%s error=%s: %s",
+                    context.symbol,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
+            logger.info(
+                "live margin balance refreshed symbol=%s margin_balance_usdt=%.4f",
+                context.symbol,
+                margin_balance,
+            )
         risk = evaluate_probe_risk(
             context,
             self.config["risk"],

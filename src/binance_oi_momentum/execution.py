@@ -476,10 +476,17 @@ class LiveExecutionEngine:
         self.planner = planner
         self.execution_config = execution_config
 
+    async def refresh_margin_equity(self) -> float:
+        account = await self.trading_client.account()
+        margin_balance = self._account_margin_balance(account)
+        self.planner.risk_config["initial_equity_usdt"] = margin_balance
+        return margin_balance
+
     async def open_probe_position(self, signal_id: int, context: SignalContext) -> dict:
         if not bool(self.execution_config.get("live_trading_enabled", False)):
             raise RuntimeError("execution.live_trading_enabled must be true before live orders are sent")
 
+        margin_balance = await self.refresh_margin_equity()
         plan = self.planner.plan_probe_position(context)
         min_notional = float(self.execution_config.get("live_min_order_notional_usdt", 5.0))
         max_notional = float(self.execution_config.get("live_max_order_notional_usdt", 0.0))
@@ -542,12 +549,23 @@ class LiveExecutionEngine:
             "stop_order": stop_order,
             "take_profit_order": take_profit_order,
             "plan": plan,
+            "margin_balance_usdt": margin_balance,
         }
 
     def _position_side(self, direction: Direction) -> dict[str, str]:
         if not bool(self.execution_config.get("hedge_mode", False)):
             return {}
         return {"positionSide": "LONG" if direction == Direction.LONG else "SHORT"}
+
+    @staticmethod
+    def _account_margin_balance(account: dict) -> float:
+        total_margin_balance = account.get("totalMarginBalance")
+        if total_margin_balance is not None:
+            return float(total_margin_balance)
+        for asset in account.get("assets", []):
+            if asset.get("asset") == "USDT" and asset.get("marginBalance") is not None:
+                return float(asset["marginBalance"])
+        raise RuntimeError("Binance account response did not include USDT margin balance")
 
     @staticmethod
     def _round_down(value: float, step_size: str) -> Decimal:

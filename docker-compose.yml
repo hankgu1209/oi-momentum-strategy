@@ -46,6 +46,10 @@ services:
       LOG_LEVEL: INFO
       OI_MOMENTUM_CONFIG: ${CONFIG_PATH:-configs/strategy.local.yaml}
       OI_MOMENTUM_LIVE_CONFIG: ${LIVE_CONFIG_PATH:-configs/strategy.live.yaml}
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET:-}
+      API_KEY: ${API_KEY:-}
+      API_SECRET: ${API_SECRET:-}
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
       # If your server needs a proxy to reach Binance, uncomment and edit:
       # HTTP_PROXY: http://host.docker.internal:7890
