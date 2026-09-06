@@ -237,8 +237,8 @@ http://localhost:8501
 When deployed behind Caddy, the dashboard basic-auth login is configured from `.env`:
 
 ```text
-user_name: admin
-pwd: GUcx0106
+DASHBOARD_USER=<your-dashboard-user>
+DASHBOARD_PASSWORD_HASH='<bcrypt-hash>'
 ```
 
 The dashboard has separate Demo and Live workspaces. Demo defaults to `configs/strategy.local.yaml`; Live defaults to `configs/strategy.live.yaml` and `data/events-live.sqlite3`. Each workspace has its own Monitor, Log, Position Chart, Strategy Logic, and Config tabs.
