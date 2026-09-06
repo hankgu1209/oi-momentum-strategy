@@ -4,6 +4,7 @@ import sqlite3
 import time
 import logging
 import os
+import shutil
 from pathlib import Path
 
 import altair as alt
@@ -17,6 +18,7 @@ from binance_oi_momentum.storage import SQLiteStorage, sqlite_path_from_url
 
 
 DEFAULT_CONFIG = os.getenv("OI_MOMENTUM_CONFIG", "configs/strategy.local.yaml")
+DEFAULT_LIVE_CONFIG = os.getenv("OI_MOMENTUM_LIVE_CONFIG", "configs/strategy.live.yaml")
 configure_logging("dashboard")
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,26 @@ def format_time_column(frame: pd.DataFrame, column: str) -> pd.DataFrame:
     if column in frame.columns and not frame.empty:
         frame[column.replace("_ms", "")] = pd.to_datetime(frame[column], unit="ms")
     return frame
+
+
+def ensure_profile_config(config_path: str, *, live: bool) -> None:
+    target = Path(config_path)
+    if target.exists():
+        return
+    template = target.with_name("strategy.example.yaml")
+    if not template.exists():
+        template = Path("configs/strategy.example.yaml")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(template, target)
+    config = load_config(target).model_dump()
+    if live:
+        config["execution"]["mode"] = "live"
+        config["execution"]["live_trading_enabled"] = False
+        config["storage"]["database_url"] = "sqlite:///data/events-live.sqlite3"
+    else:
+        config["execution"]["mode"] = "paper"
+        config["execution"]["live_trading_enabled"] = False
+    save_config(target, config)
 
 
 @st.cache_data(ttl=30)
@@ -306,7 +328,56 @@ def render_config_editor(config_path: str, config) -> None:
             help="同一 symbol 两次信号之间的最小冷却时间。",
         )
 
-        st.subheader("Paper Trading And Risk")
+        st.subheader("Execution And Risk")
+        execution_mode_options = ["research", "paper", "live"]
+        current_mode = str(execution.get("mode", "research"))
+        execution["mode"] = st.selectbox(
+            "Execution mode",
+            execution_mode_options,
+            index=execution_mode_options.index(current_mode)
+            if current_mode in execution_mode_options
+            else 0,
+            help="research/paper 只记录和模拟；live 会在信号通过风控后发送 Binance Futures 真实订单。",
+        )
+        c1, c2, c3 = st.columns(3)
+        execution["live_trading_enabled"] = c1.toggle(
+            "Live trading enabled",
+            value=bool(execution.get("live_trading_enabled", False)),
+            help="双重确认开关。只有 execution mode 为 live 且这里开启时，后端才会发送真实订单。",
+        )
+        execution["live_min_order_notional_usdt"] = c2.number_input(
+            "Live min order notional",
+            min_value=0.0,
+            value=float(execution.get("live_min_order_notional_usdt", 5.0)),
+            step=1.0,
+            help="实盘单笔初始订单最小名义金额，低于该值会拒绝下单。",
+        )
+        execution["live_max_order_notional_usdt"] = c3.number_input(
+            "Live max order notional",
+            min_value=0.0,
+            value=float(execution.get("live_max_order_notional_usdt", 20.0)),
+            step=1.0,
+            help="实盘单笔初始订单最大名义金额。设为 0 表示不额外限制，不建议实盘使用。",
+        )
+        c1, c2, c3 = st.columns(3)
+        execution["leverage"] = c1.number_input(
+            "Live leverage",
+            min_value=1,
+            value=int(execution.get("leverage", 1)),
+            step=1,
+            help="实盘下单前设置该 symbol 杠杆。1 表示不主动调整杠杆。",
+        )
+        execution["hedge_mode"] = c2.toggle(
+            "Hedge mode",
+            value=bool(execution.get("hedge_mode", False)),
+            help="账户为 Binance Hedge Mode 时开启，订单会带 positionSide=LONG/SHORT。",
+        )
+        execution["quantity_step_size"] = c3.text_input(
+            "Quantity step size",
+            value=str(execution.get("quantity_step_size", "0.001")),
+            help="实盘数量向下取整步长。不同 symbol 规则不同；建议 live universe 限定少量标的后手动设置。",
+        )
+
         c1, c2, c3 = st.columns(3)
         execution["probe_position_fraction"] = c1.number_input(
             "Probe position fraction",
@@ -510,8 +581,14 @@ def render_strategy_logic(config) -> None:
     trailing_pivot_window = int(exit_config.get("trailing_pivot_window", 5))
 
     st.header("Strategy Logic")
+    live_armed = execution.get("mode") == "live" and bool(execution.get("live_trading_enabled", False))
     st.markdown(
-        "这个系统当前是研究和纸面交易模式，用来连续记录候选、有效信号和模拟仓位，验证低流动性合约短线顺势策略是否有延续性。系统不会发送真实 Binance 下单请求。"
+        "这个系统用来连续记录候选、有效信号和仓位表现，验证低流动性合约短线顺势策略是否有延续性。"
+        + (
+            "当前配置已开启实盘，后端可能发送真实 Binance Futures 下单请求。"
+            if live_armed
+            else "当前配置未武装实盘，不会发送真实 Binance 下单请求。"
+        )
     )
 
     st.subheader("Core Hypothesis")
@@ -687,7 +764,7 @@ def render_strategy_logic(config) -> None:
         - Stop loss: 多单用突破 bar low，空单用突破 bar high
         - Take profit target: `{exit_config.get("first_take_profit_r", 0):.2f}R`，按 entry 到 stop 的实际距离计算
         - Max hold: `{exit_config["max_hold_seconds"]}` seconds
-        - Scale out enabled: `{exit_config.get("scale_out_enabled", False)}`
+        - Scale out enabled: `{scale_out_enabled}`
         - TP1 close fraction: `{exit_config.get("first_take_profit_fraction", 0.5):.2f}`
 
         持仓开启后，后端订阅该 symbol 的 Kline WebSocket。止盈/止损不再用 last/close price 判断，而是模拟真实挂单：
@@ -763,7 +840,10 @@ def render_strategy_logic(config) -> None:
         """
     )
 
-    st.warning("当前仍是研究/纸面交易系统，不会真实下单。低流动性合约滑点、插针和假突破风险很高。")
+    if live_armed:
+        st.warning("当前配置已开启实盘。低流动性合约滑点、插针和假突破风险很高。")
+    else:
+        st.warning("当前配置未武装实盘。低流动性合约滑点、插针和假突破风险很高。")
 
 
 def render_dashboard(
@@ -1170,21 +1250,23 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
     st.altair_chart(volume_chart, width="stretch")
 
 
-def main() -> None:
-    st.set_page_config(page_title="OI Momentum Monitor", layout="wide")
-    st.title("OI Momentum Monitor")
-
-    with st.sidebar:
-        config_path = st.text_input("Config", DEFAULT_CONFIG)
-        auto_refresh = st.toggle("Auto refresh", value=True)
-        refresh_seconds = st.slider("Refresh seconds", 3, 60, 10)
-        log_limit = st.selectbox("Log rows", [1000, 3000, 5000, 10000], index=0)
-
+def render_profile_workspace(
+    *,
+    profile: str,
+    default_config_path: str,
+    auto_refresh: bool,
+    refresh_seconds: int,
+    log_limit: int,
+) -> None:
+    is_live = profile == "Live"
+    config_path = st.sidebar.text_input(f"{profile} config", default_config_path)
+    ensure_profile_config(config_path, live=is_live)
     config = load_config(config_path)
     SQLiteStorage(config.storage["database_url"])
     database_path = sqlite_path_from_url(config.storage["database_url"])
     logger.info(
-        "dashboard render config=%s database=%s auto_refresh=%s refresh_seconds=%s",
+        "dashboard render profile=%s config=%s database=%s auto_refresh=%s refresh_seconds=%s",
+        profile.lower(),
         config_path,
         database_path,
         auto_refresh,
@@ -1251,6 +1333,16 @@ def main() -> None:
     )
     positions = add_unrealized_pnl(positions)
 
+    if is_live:
+        live_enabled = bool(config.execution.get("live_trading_enabled", False))
+        mode = str(config.execution.get("mode", "research"))
+        if mode == "live" and live_enabled:
+            st.warning("Live mode is armed. The scanner can send real Binance Futures orders.")
+        else:
+            st.info("Live workspace is not armed. Set mode=live and enable live trading in Config to trade.")
+    else:
+        st.info("Demo workspace uses research/paper data and does not send real orders.")
+
     dashboard_tab, log_tab, chart_tab, logic_tab, config_tab = st.tabs(
         ["Monitor", "Log", "Position Chart", "Strategy Logic", "Config"]
     )
@@ -1272,6 +1364,25 @@ def main() -> None:
     if auto_refresh:
         time.sleep(refresh_seconds)
         st.rerun()
+
+
+def main() -> None:
+    st.set_page_config(page_title="OI Momentum Monitor", layout="wide")
+    st.title("OI Momentum Monitor")
+
+    with st.sidebar:
+        profile = st.radio("Workspace", ["Demo", "Live"], horizontal=True)
+        auto_refresh = st.toggle("Auto refresh", value=True)
+        refresh_seconds = st.slider("Refresh seconds", 3, 60, 10)
+        log_limit = st.selectbox("Log rows", [1000, 3000, 5000, 10000], index=0)
+
+    render_profile_workspace(
+        profile=profile,
+        default_config_path=DEFAULT_LIVE_CONFIG if profile == "Live" else DEFAULT_CONFIG,
+        auto_refresh=auto_refresh,
+        refresh_seconds=refresh_seconds,
+        log_limit=int(log_limit),
+    )
 
 
 if __name__ == "__main__":

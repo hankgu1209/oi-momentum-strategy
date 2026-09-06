@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
+from decimal import Decimal, ROUND_DOWN
 
+from .binance import BinanceFuturesTradingClient
 from .models import Direction, KlineClosed, PaperPosition, PositionStatus, SignalContext
 from .storage import SQLiteStorage
 
@@ -23,6 +25,42 @@ class PaperExecutionEngine:
         )
 
     def open_probe_position(self, signal_id: int, context: SignalContext) -> int:
+        plan = self.plan_probe_position(context)
+        position = PaperPosition(
+            id=None,
+            signal_id=signal_id,
+            symbol=context.symbol,
+            direction=context.direction,
+            status=PositionStatus.OPEN,
+            entry_time_ms=context.timestamp_ms,
+            entry_price=context.trigger_price,
+            quantity=plan["initial_quantity"],
+            notional_usdt=plan["initial_notional"],
+            stop_loss_price=plan["stop_loss_price"],
+            take_profit_price=plan["take_profit_price"],
+            initial_quantity=plan["initial_quantity"],
+            remaining_quantity=plan["initial_quantity"],
+            remaining_notional_usdt=plan["initial_notional"],
+            scale_out_enabled=plan["scale_out_enabled"],
+            trailing_active=False,
+            take_profit_1_price=plan["take_profit_price"],
+            take_profit_2_price=None if plan["scale_out_enabled"] else plan["take_profit_price"],
+            take_profit_1_quantity=plan["initial_quantity"] * plan["first_take_profit_fraction"]
+            if plan["scale_out_enabled"]
+            else None,
+            trailing_pivot_window=plan["trailing_pivot_window"],
+            scale_in_pending=plan["scale_in_pending"],
+            scale_in_entry_price=plan["scale_in_entry_price"] if plan["scale_in_pending"] else None,
+            scale_in_fraction=plan["scale_in_fraction"] if plan["scale_in_pending"] else None,
+            entry_price_1=context.trigger_price,
+            notional_1_usdt=plan["initial_notional"],
+            entry_price_2=plan["scale_in_entry_price"] if plan["scale_in_pending"] else None,
+            notional_2_usdt=plan["scale_in_notional"] if plan["scale_in_pending"] else None,
+            max_hold_seconds=self.exit_config["max_hold_seconds"],
+        )
+        return self.storage.open_position(position)
+
+    def plan_probe_position(self, context: SignalContext) -> dict:
         has_breakout_bar = (
             context.breakout_bar_high is not None and context.breakout_bar_low is not None
         )
@@ -67,40 +105,21 @@ class PaperExecutionEngine:
             stop_loss_price=stop_loss_price,
             direction=context.direction,
         )
-
-        position = PaperPosition(
-            id=None,
-            signal_id=signal_id,
-            symbol=context.symbol,
-            direction=context.direction,
-            status=PositionStatus.OPEN,
-            entry_time_ms=context.timestamp_ms,
-            entry_price=context.trigger_price,
-            quantity=quantity,
-            notional_usdt=initial_notional,
-            stop_loss_price=stop_loss_price,
-            take_profit_price=take_profit_price,
-            initial_quantity=quantity,
-            remaining_quantity=quantity,
-            remaining_notional_usdt=initial_notional,
-            scale_out_enabled=scale_out_enabled,
-            trailing_active=False,
-            take_profit_1_price=take_profit_price,
-            take_profit_2_price=None if scale_out_enabled else take_profit_price,
-            take_profit_1_quantity=quantity * first_take_profit_fraction
-            if scale_out_enabled
-            else None,
-            trailing_pivot_window=trailing_pivot_window,
-            scale_in_pending=scale_in_pending,
-            scale_in_entry_price=scale_in_entry_price if scale_in_pending else None,
-            scale_in_fraction=scale_in_fraction if scale_in_pending else None,
-            entry_price_1=context.trigger_price,
-            notional_1_usdt=initial_notional,
-            entry_price_2=scale_in_entry_price if scale_in_pending else None,
-            notional_2_usdt=scale_in_notional if scale_in_pending else None,
-            max_hold_seconds=self.exit_config["max_hold_seconds"],
-        )
-        return self.storage.open_position(position)
+        return {
+            "initial_entry_fraction": initial_entry_fraction,
+            "scale_in_fraction": scale_in_fraction,
+            "scale_out_enabled": scale_out_enabled,
+            "first_take_profit_fraction": first_take_profit_fraction,
+            "trailing_pivot_window": trailing_pivot_window,
+            "stop_loss_price": stop_loss_price,
+            "scale_in_entry_price": scale_in_entry_price,
+            "scale_in_pending": scale_in_pending,
+            "total_notional": total_notional,
+            "initial_notional": initial_notional,
+            "scale_in_notional": scale_in_notional,
+            "initial_quantity": quantity,
+            "take_profit_price": take_profit_price,
+        }
 
     def _risk_capped_notional(
         self,
@@ -441,3 +460,106 @@ class PaperExecutionEngine:
             pnl_pct = (position.entry_price - exit_price) / position.entry_price
 
         return notional * pnl_pct, pnl_pct
+
+
+class LiveExecutionEngine:
+    """Places real Binance futures orders after the scanner and risk gate approve a signal."""
+
+    def __init__(
+        self,
+        *,
+        trading_client: BinanceFuturesTradingClient,
+        planner: PaperExecutionEngine,
+        execution_config: dict,
+    ) -> None:
+        self.trading_client = trading_client
+        self.planner = planner
+        self.execution_config = execution_config
+
+    async def open_probe_position(self, signal_id: int, context: SignalContext) -> dict:
+        if not bool(self.execution_config.get("live_trading_enabled", False)):
+            raise RuntimeError("execution.live_trading_enabled must be true before live orders are sent")
+
+        plan = self.planner.plan_probe_position(context)
+        min_notional = float(self.execution_config.get("live_min_order_notional_usdt", 5.0))
+        max_notional = float(self.execution_config.get("live_max_order_notional_usdt", 0.0))
+        notional = float(plan["initial_notional"])
+        if notional < min_notional:
+            raise RuntimeError(f"planned notional {notional:.4f} is below live minimum {min_notional:.4f}")
+        if max_notional > 0 and notional > max_notional:
+            raise RuntimeError(f"planned notional {notional:.4f} exceeds live cap {max_notional:.4f}")
+
+        leverage = int(self.execution_config.get("leverage", 1))
+        if leverage > 1:
+            await self.trading_client.change_leverage(context.symbol, leverage)
+
+        quantity = self._round_down(
+            plan["initial_quantity"],
+            str(self.execution_config.get("quantity_step_size", "0.001")),
+        )
+        if quantity <= 0:
+            raise RuntimeError("planned quantity rounded to zero")
+
+        side = "BUY" if context.direction == Direction.LONG else "SELL"
+        exit_side = "SELL" if context.direction == Direction.LONG else "BUY"
+        position_side = self._position_side(context.direction)
+
+        entry_order = await self.trading_client.new_order(
+            symbol=context.symbol,
+            side=side,
+            type=str(self.execution_config.get("order_type", "MARKET")).upper(),
+            quantity=self._decimal_str(quantity),
+            **position_side,
+        )
+        stop_order = await self.trading_client.new_order(
+            symbol=context.symbol,
+            side=exit_side,
+            type="STOP_MARKET",
+            stopPrice=self._price_str(plan["stop_loss_price"]),
+            closePosition="true",
+            workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
+            **position_side,
+        )
+        take_profit_order = await self.trading_client.new_order(
+            symbol=context.symbol,
+            side=exit_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=self._price_str(plan["take_profit_price"]),
+            closePosition="true",
+            workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
+            **position_side,
+        )
+        logger.info(
+            "live orders placed signal_id=%s symbol=%s direction=%s quantity=%s notional=%.4f",
+            signal_id,
+            context.symbol,
+            context.direction.value,
+            self._decimal_str(quantity),
+            notional,
+        )
+        return {
+            "entry_order": entry_order,
+            "stop_order": stop_order,
+            "take_profit_order": take_profit_order,
+            "plan": plan,
+        }
+
+    def _position_side(self, direction: Direction) -> dict[str, str]:
+        if not bool(self.execution_config.get("hedge_mode", False)):
+            return {}
+        return {"positionSide": "LONG" if direction == Direction.LONG else "SHORT"}
+
+    @staticmethod
+    def _round_down(value: float, step_size: str) -> Decimal:
+        step = Decimal(step_size)
+        if step <= 0:
+            return Decimal(str(value))
+        return Decimal(str(value)).quantize(step, rounding=ROUND_DOWN)
+
+    @staticmethod
+    def _decimal_str(value: Decimal) -> str:
+        return format(value.normalize(), "f")
+
+    @staticmethod
+    def _price_str(value: float) -> str:
+        return format(Decimal(str(value)).normalize(), "f")

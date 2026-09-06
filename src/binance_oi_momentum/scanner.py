@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .binance import BinanceMarketClient
+from .binance import BinanceFuturesTradingClient, BinanceMarketClient
 from .config import load_config
-from .execution import PaperExecutionEngine
+from .execution import LiveExecutionEngine, PaperExecutionEngine
 from .models import CurrentOpenInterest, Direction, MarketSnapshot, OIContext, PriceTick, SignalContext
 from .risk import evaluate_probe_risk
 from .storage import SQLiteStorage
@@ -69,6 +70,9 @@ class MarketScanner:
             config["execution"],
             config["exit"],
         )
+        self.live_execution: LiveExecutionEngine | None = None
+        if config["execution"].get("mode") == "live":
+            self.live_execution = self._build_live_execution_engine()
         self.symbols: set[str] = set()
         self._last_heartbeat_ms = 0
         self._last_config_check_ms = 0
@@ -165,6 +169,10 @@ class MarketScanner:
         self.execution.risk_config = self.config["risk"]
         self.execution.execution_config = self.config["execution"]
         self.execution.exit_config = self.config["exit"]
+        if self.config["execution"].get("mode") == "live":
+            self.live_execution = self._build_live_execution_engine()
+        else:
+            self.live_execution = None
         self.config_mtime = current_mtime
 
         if old_universe != self.config.get("universe", {}):
@@ -488,6 +496,56 @@ class MarketScanner:
                 context.direction.value,
                 context.trigger_price,
             )
+        elif risk.allowed and self.config["execution"]["mode"] == "live":
+            if self.live_execution is None:
+                logger.error("live execution unavailable signal_id=%s symbol=%s", signal_id, context.symbol)
+                return
+            try:
+                result = await self.live_execution.open_probe_position(signal_id, context)
+            except Exception as exc:
+                logger.exception(
+                    "live order placement failed signal_id=%s symbol=%s error=%s: %s",
+                    signal_id,
+                    context.symbol,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
+            self.storage.record_latest_price(context.symbol, context.timestamp_ms, context.trigger_price)
+            logger.info(
+                "live position entry submitted signal_id=%s symbol=%s entry_order_id=%s",
+                signal_id,
+                context.symbol,
+                result.get("entry_order", {}).get("orderId"),
+            )
+
+    def _build_live_execution_engine(self) -> LiveExecutionEngine:
+        api_key = (
+            os.getenv("BINANCE_API_KEY")
+            or os.getenv("BINANCE_FUTURES_API_KEY")
+            or os.getenv("API_KEY")
+        )
+        api_secret = (
+            os.getenv("BINANCE_API_SECRET")
+            or os.getenv("BINANCE_FUTURES_API_SECRET")
+            or os.getenv("API_SECRET")
+        )
+        if not api_key or not api_secret:
+            raise RuntimeError(
+                "live execution requires BINANCE_API_KEY/BINANCE_API_SECRET in the environment"
+            )
+        trading_client = BinanceFuturesTradingClient(
+            rest_base_url=self.config["exchange"]["rest_base_url"],
+            api_key=api_key,
+            api_secret=api_secret,
+            request_timeout_seconds=self.config["exchange"]["request_timeout_seconds"],
+            recv_window_ms=int(self.config["exchange"].get("recv_window_ms", 5000)),
+        )
+        return LiveExecutionEngine(
+            trading_client=trading_client,
+            planner=self.execution,
+            execution_config=self.config["execution"],
+        )
 
     def _snapshot(
         self,

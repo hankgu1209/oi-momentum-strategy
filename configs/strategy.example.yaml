@@ -7,6 +7,7 @@ exchange:
   rest_base_url: "https://fapi.binance.com"
   request_timeout_seconds: 15
   rest_retries: 5
+  recv_window_ms: 5000
 
 universe:
   quote_asset: "USDT"
@@ -16,6 +17,7 @@ universe:
     - "ETHUSDT"
     - "SOLUSDT"
     - "BNBUSDT"
+    - "BTCUSDC"
 
   min_24h_quote_volume: 10000000
   max_24h_quote_volume: 500000000
@@ -47,6 +49,13 @@ signal:
 
 execution:
   mode: "research"
+  live_trading_enabled: false
+  live_min_order_notional_usdt: 5
+  live_max_order_notional_usdt: 20
+  leverage: 1
+  hedge_mode: false
+  quantity_step_size: "0.001"
+  working_type: "MARK_PRICE"
   probe_position_fraction: 0.20
   initial_entry_fraction: 0.30
   scale_in_retrace_fraction: 0.40

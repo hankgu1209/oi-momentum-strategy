@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from urllib.parse import urlencode
 from typing import Any
 
 import aiohttp
@@ -14,6 +17,13 @@ from .models import CurrentOpenInterest, KlineClosed, KlineVolumeContext, OICont
 
 
 logger = logging.getLogger(__name__)
+
+
+class BinanceAPIError(RuntimeError):
+    def __init__(self, *, status: int, message: str) -> None:
+        super().__init__(f"binance api error status={status} body={message}")
+        self.status = status
+        self.message = message
 
 
 class BinanceMarketClient:
@@ -264,3 +274,65 @@ class BinanceMarketClient:
             )
         except (KeyError, TypeError, ValueError):
             return None
+
+
+class BinanceFuturesTradingClient:
+    """Minimal signed REST client for Binance USDT-M futures live execution."""
+
+    def __init__(
+        self,
+        *,
+        rest_base_url: str,
+        api_key: str,
+        api_secret: str,
+        request_timeout_seconds: float,
+        recv_window_ms: int = 5000,
+    ) -> None:
+        self.rest_base_url = rest_base_url.rstrip("/")
+        self.api_key = api_key
+        self.api_secret = api_secret.encode("utf-8")
+        self.timeout = aiohttp.ClientTimeout(total=request_timeout_seconds)
+        self.recv_window_ms = recv_window_ms
+
+    async def account(self) -> dict[str, Any]:
+        return await self._signed_request("GET", "/fapi/v2/account")
+
+    async def change_leverage(self, symbol: str, leverage: int) -> dict[str, Any]:
+        return await self._signed_request(
+            "POST",
+            "/fapi/v1/leverage",
+            {"symbol": symbol, "leverage": leverage},
+        )
+
+    async def new_order(self, **params: Any) -> dict[str, Any]:
+        return await self._signed_request("POST", "/fapi/v1/order", params)
+
+    async def _signed_request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        payload = dict(params or {})
+        payload["timestamp"] = int(time.time() * 1000)
+        payload["recvWindow"] = self.recv_window_ms
+        query = urlencode(payload, doseq=True)
+        signature = hmac.new(self.api_secret, query.encode("utf-8"), hashlib.sha256).hexdigest()
+        signed_query = f"{query}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        url = f"{self.rest_base_url}{path}"
+        async with aiohttp.ClientSession(timeout=self.timeout, trust_env=True) as session:
+            if method.upper() == "GET":
+                async with session.get(f"{url}?{signed_query}", headers=headers) as response:
+                    await self._raise_for_status(response)
+                    return await response.json()
+            async with session.post(f"{url}?{signed_query}", headers=headers) as response:
+                await self._raise_for_status(response)
+                return await response.json()
+
+    @staticmethod
+    async def _raise_for_status(response: aiohttp.ClientResponse) -> None:
+        if response.status < 400:
+            return
+        body = await response.text()
+        raise BinanceAPIError(status=response.status, message=body)

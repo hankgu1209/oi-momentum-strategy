@@ -98,9 +98,32 @@ Run the Streamlit dashboard in another terminal:
 streamlit run src/binance_oi_momentum/app.py
 ```
 
-The current implementation is a non-trading research and paper-trading logger. It subscribes to the Binance all-market mini ticker stream, keeps short rolling windows locally, fetches Kline and `openInterestHist` data only after a price candidate appears, records both candidate checks and accepted signals into SQLite, and opens simulated positions with fixed stop loss, take profit, and max holding time. Do not connect live trading keys until the signal has been measured through backtest and paper trading.
+The default implementation is a research and paper-trading logger. It subscribes to the Binance all-market mini ticker stream, keeps short rolling windows locally, fetches Kline and `openInterestHist` data only after a price candidate appears, records both candidate checks and accepted signals into SQLite, and opens simulated positions with fixed stop loss, take profit, and max holding time.
 
-The dashboard `Config` tab edits `configs/strategy.local.yaml` by default. This file is ignored by Git, so server-side parameter changes do not block future deploys. It includes a `Scanner enabled` switch. Turn it off and save before changing strategy parameters; the backend process stays alive and hot-reloads the YAML, but it stops processing market ticks and will not create new signals or paper positions. Turn it back on and save when you are ready to resume scanning.
+The dashboard `Config` tab edits `configs/strategy.local.yaml` by default. This file is ignored by Git, so server-side parameter changes do not block future deploys. It includes a `Scanner enabled` switch. Turn it off and save before changing strategy parameters; the backend process stays alive and hot-reloads the YAML, but it stops processing market ticks and will not create new signals or positions. Turn it back on and save when you are ready to resume scanning.
+
+## Live Trading
+
+Live trading is supported only when explicitly enabled. Keep Binance API keys in `.env`:
+
+```bash
+BINANCE_API_KEY=...
+BINANCE_API_SECRET=...
+```
+
+Then edit `configs/strategy.local.yaml`:
+
+```yaml
+execution:
+  mode: "live"
+  live_trading_enabled: true
+  live_max_order_notional_usdt: 20
+  leverage: 1
+```
+
+In live mode the scanner sends the initial market entry after a signal passes the existing risk gate, then immediately places `STOP_MARKET` and `TAKE_PROFIT_MARKET` close-position orders. The default live cap is intentionally tiny. Per-symbol Binance quantity steps vary, so set `quantity_step_size` conservatively for the contracts you allow, or restrict `universe.include_symbols` before enabling live trading.
+
+This is real USDT-M futures execution. Start with testnet or very small size, verify Binance Futures permissions, and make sure the API key has no withdrawal permission.
 
 ## Signal Logic
 
@@ -210,6 +233,15 @@ Open the dashboard:
 ```text
 http://localhost:8501
 ```
+
+When deployed behind Caddy, the dashboard basic-auth login is configured from `.env`:
+
+```text
+user_name: admin
+pwd: GUcx0106
+```
+
+The dashboard has separate Demo and Live workspaces. Demo defaults to `configs/strategy.local.yaml`; Live defaults to `configs/strategy.live.yaml` and `data/events-live.sqlite3`. Each workspace has its own Monitor, Log, Position Chart, Strategy Logic, and Config tabs.
 
 Useful commands:
 
