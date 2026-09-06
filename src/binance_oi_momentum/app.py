@@ -1237,12 +1237,20 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
     selected_label = st.selectbox("Position", labels)
     position = positions.iloc[labels.index(selected_label)]
     position_id = int(position["id"])
+    position_status = str(position.get("status") or "unknown")
+    pnl_label = "Realized PnL" if position_status == "closed" else "Unrealized PnL"
+    pnl_value = position.get("pnl_usdt") if position_status == "closed" else position.get("unrealized_pnl_usdt")
+    try:
+        pnl_usdt = float(pnl_value or 0)
+    except (TypeError, ValueError):
+        pnl_usdt = 0.0
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Entry", f"{position['entry_price']:g}")
     c2.metric("Stop", f"{position['stop_loss_price']:g}")
     c3.metric("TP1", f"{position.get('take_profit_1_price', position['take_profit_price']):g}")
-    c4.metric("Unrealized", f"{position.get('unrealized_pnl_usdt', 0):.2f} USDT")
+    c4.metric("Status", position_status)
+    c5.metric(pnl_label, f"{pnl_usdt:.2f} USDT")
 
     entry_time_ms = position_time_ms(position, "entry_time_ms") or int(time.time() * 1000)
     event_times = [
