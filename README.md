@@ -360,6 +360,8 @@ DASHBOARD_PASSWORD_HASH='$2a$14$...'
 CADDY_HTTP_PORT=80
 CADDY_HTTPS_PORT=443
 CONFIG_PATH=configs/strategy.local.yaml
+DEMO_CONFIG_PATH=configs/strategy.local.yaml
+LIVE_CONFIG_PATH=configs/strategy.live.yaml
 ```
 
 Keep the password hash wrapped in single quotes so Docker Compose does not interpret the `$` characters.

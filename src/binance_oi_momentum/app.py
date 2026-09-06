@@ -19,7 +19,10 @@ from binance_oi_momentum.logging_utils import configure_logging
 from binance_oi_momentum.storage import SQLiteStorage, sqlite_path_from_url
 
 
-DEFAULT_CONFIG = os.getenv("OI_MOMENTUM_CONFIG", "configs/strategy.local.yaml")
+DEFAULT_CONFIG = os.getenv(
+    "OI_MOMENTUM_DEMO_CONFIG",
+    os.getenv("OI_MOMENTUM_CONFIG", "configs/strategy.local.yaml"),
+)
 DEFAULT_LIVE_CONFIG = os.getenv("OI_MOMENTUM_LIVE_CONFIG", "configs/strategy.live.yaml")
 configure_logging("dashboard")
 logger = logging.getLogger(__name__)

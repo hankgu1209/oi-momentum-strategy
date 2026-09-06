@@ -44,7 +44,8 @@ services:
     environment:
       TZ: Asia/Shanghai
       LOG_LEVEL: INFO
-      OI_MOMENTUM_CONFIG: ${CONFIG_PATH:-configs/strategy.local.yaml}
+      OI_MOMENTUM_DEMO_CONFIG: ${DEMO_CONFIG_PATH:-configs/strategy.local.yaml}
+      OI_MOMENTUM_CONFIG: ${DEMO_CONFIG_PATH:-configs/strategy.local.yaml}
       OI_MOMENTUM_LIVE_CONFIG: ${LIVE_CONFIG_PATH:-configs/strategy.live.yaml}
       BINANCE_API_KEY: ${BINANCE_API_KEY:-}
       BINANCE_API_SECRET: ${BINANCE_API_SECRET:-}
