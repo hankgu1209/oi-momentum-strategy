@@ -297,6 +297,13 @@ class BinanceFuturesTradingClient:
     async def account(self) -> dict[str, Any]:
         return await self._signed_request("GET", "/fapi/v2/account")
 
+    async def exchange_info(self) -> dict[str, Any]:
+        """Return public symbol rules used to validate live order parameters."""
+        async with aiohttp.ClientSession(timeout=self.timeout, trust_env=True) as session:
+            async with session.get(f"{self.rest_base_url}/fapi/v1/exchangeInfo") as response:
+                await BinanceMarketClient._raise_for_status(response)
+                return await response.json()
+
     async def change_leverage(self, symbol: str, leverage: int) -> dict[str, Any]:
         return await self._signed_request(
             "POST",

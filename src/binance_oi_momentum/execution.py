@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 
 from .binance import BinanceFuturesTradingClient
 from .models import Direction, KlineClosed, PaperPosition, PositionStatus, SignalContext
@@ -499,16 +499,41 @@ class LiveExecutionEngine:
         if max_notional > 0 and notional > max_notional:
             raise RuntimeError(f"planned notional {notional:.4f} exceeds live cap {max_notional:.4f}")
 
+        symbol_rules = await self._symbol_rules(context.symbol)
+        lot_size = symbol_rules["LOT_SIZE"]
+        price_filter = symbol_rules["PRICE_FILTER"]
+
         leverage = int(self.execution_config.get("leverage", 1))
         if leverage > 1:
             await self.trading_client.change_leverage(context.symbol, leverage)
 
         quantity = self._round_down(
             plan["initial_quantity"],
-            str(self.execution_config.get("quantity_step_size", "0.001")),
+            lot_size.get(
+                "stepSize",
+                str(self.execution_config.get("quantity_step_size", "0.001")),
+            ),
         )
         if quantity <= 0:
             raise RuntimeError("planned quantity rounded to zero")
+        min_qty = Decimal(str(lot_size.get("minQty", "0")))
+        max_qty = Decimal(str(lot_size.get("maxQty", "0")))
+        if quantity < min_qty:
+            raise RuntimeError(
+                f"planned quantity {self._decimal_str(quantity)} is below Binance minQty "
+                f"{self._decimal_str(min_qty)} for {context.symbol}"
+            )
+        if max_qty > 0 and quantity > max_qty:
+            raise RuntimeError(
+                f"planned quantity {self._decimal_str(quantity)} exceeds Binance maxQty "
+                f"{self._decimal_str(max_qty)} for {context.symbol}"
+            )
+
+        price_tick = price_filter.get("tickSize")
+        stop_price = self._round_down(plan["stop_loss_price"], price_tick)
+        take_profit_price = self._round_down(plan["take_profit_price"], price_tick)
+        if stop_price <= 0 or take_profit_price <= 0:
+            raise RuntimeError(f"invalid rounded exit price for {context.symbol}")
 
         side = "BUY" if context.direction == Direction.LONG else "SELL"
         exit_side = "SELL" if context.direction == Direction.LONG else "BUY"
@@ -525,7 +550,7 @@ class LiveExecutionEngine:
             symbol=context.symbol,
             side=exit_side,
             type="STOP_MARKET",
-            stopPrice=self._price_str(plan["stop_loss_price"]),
+            stopPrice=self._decimal_str(stop_price),
             closePosition="true",
             workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
             **position_side,
@@ -534,7 +559,7 @@ class LiveExecutionEngine:
             symbol=context.symbol,
             side=exit_side,
             type="TAKE_PROFIT_MARKET",
-            stopPrice=self._price_str(plan["take_profit_price"]),
+            stopPrice=self._decimal_str(take_profit_price),
             closePosition="true",
             workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
             **position_side,
@@ -553,7 +578,26 @@ class LiveExecutionEngine:
             "take_profit_order": take_profit_order,
             "plan": plan,
             "margin_balance_usdt": margin_balance,
+            "symbol_rules": symbol_rules,
         }
+
+    async def _symbol_rules(self, symbol: str) -> dict[str, dict[str, str]]:
+        exchange_info = await self.trading_client.exchange_info()
+        for item in exchange_info.get("symbols", []):
+            if item.get("symbol") != symbol:
+                continue
+            filters = {
+                str(rule.get("filterType")): rule
+                for rule in item.get("filters", [])
+                if rule.get("filterType") in {"LOT_SIZE", "PRICE_FILTER"}
+            }
+            missing = {"LOT_SIZE", "PRICE_FILTER"} - filters.keys()
+            if missing:
+                raise RuntimeError(
+                    f"Binance exchange info missing {', '.join(sorted(missing))} for {symbol}"
+                )
+            return filters
+        raise RuntimeError(f"Binance exchange info did not contain symbol {symbol}")
 
     def _position_side(self, direction: Direction) -> dict[str, str]:
         if not bool(self.execution_config.get("hedge_mode", False)):
@@ -571,16 +615,15 @@ class LiveExecutionEngine:
         raise RuntimeError("Binance account response did not include USDT margin balance")
 
     @staticmethod
-    def _round_down(value: float, step_size: str) -> Decimal:
+    def _round_down(value: float | Decimal, step_size: str | None) -> Decimal:
+        if not step_size:
+            return Decimal(str(value))
         step = Decimal(step_size)
         if step <= 0:
             return Decimal(str(value))
-        return Decimal(str(value)).quantize(step, rounding=ROUND_DOWN)
+        value_decimal = Decimal(str(value))
+        return (value_decimal // step) * step
 
     @staticmethod
     def _decimal_str(value: Decimal) -> str:
         return format(value.normalize(), "f")
-
-    @staticmethod
-    def _price_str(value: float) -> str:
-        return format(Decimal(str(value)).normalize(), "f")
