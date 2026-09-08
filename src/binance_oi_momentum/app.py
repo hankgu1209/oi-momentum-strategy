@@ -310,6 +310,65 @@ def add_unrealized_pnl(positions: pd.DataFrame) -> pd.DataFrame:
     return positions
 
 
+def merge_live_account_positions(
+    positions: pd.DataFrame,
+    account: dict | None,
+) -> pd.DataFrame:
+    """Show exchange positions even when local persistence missed a partial failure."""
+    if not account or account.get("error"):
+        return positions
+
+    existing = {
+        (str(row.symbol), str(row.direction))
+        for row in positions.itertuples(index=False)
+        if str(getattr(row, "status", "")) == "open"
+    }
+    rows = []
+    for index, raw in enumerate(account.get("positions", [])):
+        try:
+            amount = float(raw.get("positionAmt", 0))
+            entry_price = float(raw.get("entryPrice") or 0)
+            mark_price = float(raw.get("markPrice") or entry_price)
+            unrealized = float(raw.get("unrealizedProfit") or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(amount) <= 0 or entry_price <= 0:
+            continue
+        direction = "short" if amount < 0 else "long"
+        symbol = str(raw.get("symbol") or "")
+        if not symbol or (symbol, direction) in existing:
+            continue
+        notional = abs(float(raw.get("notional") or amount * mark_price))
+        rows.append(
+            {
+                "id": -1_000_000 - index,
+                "signal_id": None,
+                "symbol": symbol,
+                "direction": direction,
+                "status": "open",
+                "entry_time_ms": int(raw.get("updateTime") or time.time() * 1000),
+                "entry_price": entry_price,
+                "quantity": abs(amount),
+                "notional_usdt": notional,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+                "take_profit_1_price": None,
+                "take_profit_2_price": None,
+                "current_price": mark_price,
+                "remaining_quantity": abs(amount),
+                "remaining_notional_usdt": notional,
+                "unrealized_pnl_usdt": unrealized,
+                "unrealized_pnl_pct": unrealized / notional if notional > 0 else 0.0,
+                "pnl_usdt": None,
+                "pnl_pct": None,
+                "source": "binance_account",
+            }
+        )
+    if not rows:
+        return positions
+    return pd.concat([positions, pd.DataFrame(rows)], ignore_index=True, sort=False)
+
+
 def render_config_editor(config_path: str, config) -> None:
     st.header("Config")
     st.caption("保存后会写入 YAML。后端 scanner 每 5 秒检测一次配置文件变化，大部分策略阈值无需重新发版即可生效。")
@@ -1292,8 +1351,11 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Entry", f"{position['entry_price']:g}")
-    c2.metric("Stop", f"{position['stop_loss_price']:g}")
-    c3.metric("TP1", f"{position.get('take_profit_1_price', position['take_profit_price']):g}")
+    stop_text = "--" if pd.isna(position.get("stop_loss_price")) else f"{position['stop_loss_price']:g}"
+    tp1_value = position.get("take_profit_1_price") or position.get("take_profit_price")
+    tp1_text = "--" if pd.isna(tp1_value) else f"{tp1_value:g}"
+    c2.metric("Stop", stop_text)
+    c3.metric("TP1", tp1_text)
     c4.metric("Status", position_status)
     c5.metric("Realized Profit", f"{realized_pnl_usdt:.2f} USDT")
     c6.metric("Unrealized PnL", f"{unrealized_pnl_usdt:.2f} USDT")
@@ -1454,9 +1516,13 @@ def render_position_chart(config, positions: pd.DataFrame) -> None:
     )
     level_rows = [
         {"level": "Entry", "price": position["entry_price"]},
-        {"level": "Stop Loss", "price": position["stop_loss_price"]},
-        {"level": "Take Profit 1", "price": position.get("take_profit_1_price") or position["take_profit_price"]},
     ]
+    stop_loss_price = position.get("stop_loss_price")
+    if pd.notna(stop_loss_price) and float(stop_loss_price) > 0:
+        level_rows.append({"level": "Stop Loss", "price": stop_loss_price})
+    take_profit_price = position.get("take_profit_1_price") or position.get("take_profit_price")
+    if pd.notna(take_profit_price) and float(take_profit_price) > 0:
+        level_rows.append({"level": "Take Profit 1", "price": take_profit_price})
     if pd.notna(position.get("take_profit_2_price")):
         level_rows.append({"level": "Take Profit 2", "price": position["take_profit_2_price"]})
     if pd.notna(position.get("trailing_stop_price")):
@@ -1663,6 +1729,7 @@ def render_profile_workspace(
             int(config.exchange.get("recv_window_ms", 5000)),
         )
         if mode == "live" and live_enabled:
+            positions = merge_live_account_positions(positions, live_account)
             st.warning("Live mode is armed. The scanner can send real Binance Futures orders.")
         else:
             st.info("Live workspace is not armed. Set mode=live and enable live trading in Config to trade.")

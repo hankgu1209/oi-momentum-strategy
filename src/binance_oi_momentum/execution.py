@@ -546,24 +546,38 @@ class LiveExecutionEngine:
             quantity=self._decimal_str(quantity),
             **position_side,
         )
-        stop_order = await self.trading_client.new_order(
-            symbol=context.symbol,
-            side=exit_side,
-            type="STOP_MARKET",
-            stopPrice=self._decimal_str(stop_price),
-            closePosition="true",
-            workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
-            **position_side,
-        )
-        take_profit_order = await self.trading_client.new_order(
-            symbol=context.symbol,
-            side=exit_side,
-            type="TAKE_PROFIT_MARKET",
-            stopPrice=self._decimal_str(take_profit_price),
-            closePosition="true",
-            workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
-            **position_side,
-        )
+        protection_error = None
+        stop_order = None
+        take_profit_order = None
+        try:
+            stop_order = await self.trading_client.new_algo_order(
+                algoType="CONDITIONAL",
+                symbol=context.symbol,
+                side=exit_side,
+                type="STOP_MARKET",
+                triggerPrice=self._decimal_str(stop_price),
+                closePosition="true",
+                workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
+                **position_side,
+            )
+            take_profit_order = await self.trading_client.new_algo_order(
+                algoType="CONDITIONAL",
+                symbol=context.symbol,
+                side=exit_side,
+                type="TAKE_PROFIT_MARKET",
+                triggerPrice=self._decimal_str(take_profit_price),
+                closePosition="true",
+                workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
+                **position_side,
+            )
+        except Exception as exc:
+            protection_error = f"{type(exc).__name__}: {exc}"
+            logger.exception(
+                "live protection order placement failed signal_id=%s symbol=%s error=%s",
+                signal_id,
+                context.symbol,
+                protection_error,
+            )
         logger.info(
             "live orders placed signal_id=%s symbol=%s direction=%s quantity=%s notional=%.4f",
             signal_id,
@@ -579,6 +593,7 @@ class LiveExecutionEngine:
             "plan": plan,
             "margin_balance_usdt": margin_balance,
             "symbol_rules": symbol_rules,
+            "protection_error": protection_error,
         }
 
     async def _symbol_rules(self, symbol: str) -> dict[str, dict[str, str]]:

@@ -314,6 +314,9 @@ class BinanceFuturesTradingClient:
     async def new_order(self, **params: Any) -> dict[str, Any]:
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
+    async def new_algo_order(self, **params: Any) -> dict[str, Any]:
+        return await self._signed_request("POST", "/fapi/v1/algoOrder", params)
+
     async def _signed_request(
         self,
         method: str,

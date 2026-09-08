@@ -557,10 +557,19 @@ class MarketScanner:
             self.storage.record_latest_price(context.symbol, context.timestamp_ms, context.trigger_price)
             self.storage.update_signal_execution(
                 signal_id,
-                execution_status="live_submitted",
+                execution_status=(
+                    "live_protection_failed"
+                    if result.get("protection_error")
+                    else "live_submitted"
+                ),
                 execution_reason=(
                     f"position_id={position_id} entry_order_id="
                     f"{result.get('entry_order', {}).get('orderId')}"
+                    + (
+                        f" protection_error={result['protection_error']}"
+                        if result.get("protection_error")
+                        else ""
+                    )
                 ),
             )
             logger.info(
