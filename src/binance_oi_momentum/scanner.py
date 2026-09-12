@@ -232,7 +232,10 @@ class MarketScanner:
 
     async def _consume_position_klines(self, symbols: set[str], interval: str) -> None:
         async for kline in self.client.kline_stream(symbols, interval=interval):
-            self.execution.update_position_kline(kline)
+            if self.live_execution is not None:
+                await self.live_execution.update_position_kline(kline)
+            else:
+                self.execution.update_position_kline(kline)
 
     async def _handle_tick(self, tick: PriceTick) -> None:
         state = self.states[tick.symbol]

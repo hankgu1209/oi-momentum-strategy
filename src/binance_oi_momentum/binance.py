@@ -317,6 +317,15 @@ class BinanceFuturesTradingClient:
     async def new_algo_order(self, **params: Any) -> dict[str, Any]:
         return await self._signed_request("POST", "/fapi/v1/algoOrder", params)
 
+    async def cancel_algo_order(self, **params: Any) -> dict[str, Any]:
+        return await self._signed_request("DELETE", "/fapi/v1/algoOrder", params)
+
+    async def open_algo_orders(self, **params: Any) -> list[dict[str, Any]]:
+        return await self._signed_request("GET", "/fapi/v1/openAlgoOrders", params)
+
+    async def user_trades(self, **params: Any) -> list[dict[str, Any]]:
+        return await self._signed_request("GET", "/fapi/v1/userTrades", params)
+
     async def _signed_request(
         self,
         method: str,
@@ -336,7 +345,8 @@ class BinanceFuturesTradingClient:
                 async with session.get(f"{url}?{signed_query}", headers=headers) as response:
                     await self._raise_for_status(response)
                     return await response.json()
-            async with session.post(f"{url}?{signed_query}", headers=headers) as response:
+            request = session.delete if method.upper() == "DELETE" else session.post
+            async with request(f"{url}?{signed_query}", headers=headers) as response:
                 await self._raise_for_status(response)
                 return await response.json()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict, deque
 from decimal import Decimal
 
@@ -478,6 +479,11 @@ class LiveExecutionEngine:
         self.trading_client = trading_client
         self.planner = planner
         self.execution_config = execution_config
+        self.closed_klines: defaultdict[str, deque[KlineClosed]] = defaultdict(
+            lambda: deque(maxlen=200)
+        )
+        if hasattr(self.planner, "closed_klines"):
+            self.planner.closed_klines = self.closed_klines
 
     async def refresh_margin_equity(self) -> float:
         account = await self.trading_client.account()
@@ -536,7 +542,6 @@ class LiveExecutionEngine:
             raise RuntimeError(f"invalid rounded exit price for {context.symbol}")
 
         side = "BUY" if context.direction == Direction.LONG else "SELL"
-        exit_side = "SELL" if context.direction == Direction.LONG else "BUY"
         position_side = self._position_side(context.direction)
 
         entry_order = await self.trading_client.new_order(
@@ -550,25 +555,13 @@ class LiveExecutionEngine:
         stop_order = None
         take_profit_order = None
         try:
-            stop_order = await self.trading_client.new_algo_order(
-                algoType="CONDITIONAL",
+            stop_order, take_profit_order = await self._place_protection_orders(
                 symbol=context.symbol,
-                side=exit_side,
-                type="STOP_MARKET",
-                triggerPrice=self._decimal_str(stop_price),
-                closePosition="true",
-                workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
-                **position_side,
-            )
-            take_profit_order = await self.trading_client.new_algo_order(
-                algoType="CONDITIONAL",
-                symbol=context.symbol,
-                side=exit_side,
-                type="TAKE_PROFIT_MARKET",
-                triggerPrice=self._decimal_str(take_profit_price),
-                closePosition="true",
-                workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
-                **position_side,
+                direction=context.direction,
+                quantity=quantity,
+                stop_price=stop_price,
+                take_profit_price=take_profit_price,
+                symbol_rules=symbol_rules,
             )
         except Exception as exc:
             protection_error = f"{type(exc).__name__}: {exc}"
@@ -595,6 +588,325 @@ class LiveExecutionEngine:
             "symbol_rules": symbol_rules,
             "protection_error": protection_error,
         }
+
+    async def update_position_kline(self, kline: KlineClosed) -> None:
+        """Apply the paper state machine using real orders for every action."""
+        if kline.is_closed:
+            self.closed_klines[kline.symbol].append(kline)
+
+        for position in self.planner.storage.get_open_positions():
+            if position.symbol != kline.symbol or position.id is None:
+                continue
+
+            exit_decision = self.planner._kline_exit_decision(position, kline)
+            if exit_decision is not None:
+                reason, price = exit_decision
+                if reason in {"trailing_pivot", "time_exit"}:
+                    await self._market_close(position, reason)
+                else:
+                    # The pre-placed Binance protection order owns SL/TP execution.
+                    # Reconcile the local row only after the exchange position is gone.
+                    await self._reconcile_position(position)
+                continue
+
+            if self.planner._should_scale_in_on_kline(position, kline):
+                await self._scale_in(position, kline.close_time_ms)
+                position = self.planner.storage.get_position(position.id) or position
+
+            if self.planner._should_take_profit_1_on_kline(position, kline):
+                # Binance owns the conditional TP1 fill. Once it is hit, mark the
+                # local state and leave only the remaining quantity for trailing.
+                if not await self._exchange_position_is_reduced(position):
+                    continue
+                target = position.take_profit_1_price or position.take_profit_price
+                self.planner._mark_first_take_profit(position, target, kline.close_time_ms)
+                position = self.planner.storage.get_position(position.id) or position
+                await self._replace_protection_orders(position)
+                continue
+
+            if not position.trailing_active or not kline.is_closed:
+                continue
+            pivot = self._pivot_stop(position, exclude_latest=True)
+            if pivot is None:
+                continue
+            trailing_stop = self._effective_trailing_stop(position, pivot)
+            self.planner.storage.update_trailing_stop(position.id, trailing_stop)
+            logger.info(
+                "live position trailing stop updated position_id=%s symbol=%s "
+                "trailing_stop=%.8g",
+                position.id,
+                position.symbol,
+                trailing_stop,
+            )
+
+    async def _scale_in(self, position: PaperPosition, timestamp_ms: int) -> None:
+        if position.id is None or position.scale_in_entry_price is None:
+            return
+        filled_fraction = 1.0 - float(position.scale_in_fraction or 0.0)
+        if filled_fraction <= 0:
+            return
+        add_notional = position.notional_2_usdt or (
+            position.notional_usdt * float(position.scale_in_fraction or 0.0) / filled_fraction
+        )
+        rules = await self._symbol_rules(position.symbol)
+        step = rules["LOT_SIZE"].get("stepSize")
+        quantity = self._round_down(add_notional / position.scale_in_entry_price, step)
+        if quantity <= 0:
+            raise RuntimeError(f"scale-in quantity rounded to zero for {position.symbol}")
+        side = "BUY" if position.direction == Direction.LONG else "SELL"
+        order = await self.trading_client.new_order(
+            symbol=position.symbol,
+            side=side,
+            type="MARKET",
+            quantity=self._decimal_str(quantity),
+            **self._position_side(position.direction),
+        )
+        fill_price = float(order.get("avgPrice") or position.scale_in_entry_price)
+        new_notional = position.notional_usdt + float(quantity) * fill_price
+        new_quantity = position.quantity + float(quantity)
+        new_entry = new_notional / new_quantity
+        stop = position.stop_loss_price
+        tp = self.planner._take_profit_price(
+            entry_price=new_entry,
+            stop_loss_price=stop,
+            direction=position.direction,
+        )
+        first_qty = (
+            new_quantity * float(self.planner.exit_config.get("first_take_profit_fraction", 0.5))
+            if position.scale_out_enabled else None
+        )
+        self.planner.storage.mark_scale_in_filled(
+            position.id,
+            timestamp_ms=timestamp_ms,
+            entry_price=new_entry,
+            quantity=new_quantity,
+            notional_usdt=new_notional,
+            remaining_quantity=new_quantity,
+            remaining_notional_usdt=new_notional,
+            take_profit_price=tp,
+            take_profit_1_price=tp,
+            take_profit_2_price=None if position.scale_out_enabled else tp,
+            take_profit_1_quantity=first_qty,
+        )
+        updated = self.planner.storage.get_position(position.id)
+        if updated is not None:
+            await self._replace_protection_orders(updated)
+        logger.info(
+            "live position scale-in filled position_id=%s symbol=%s quantity=%s price=%.8g",
+            position.id,
+            position.symbol,
+            self._decimal_str(quantity),
+            fill_price,
+        )
+
+    async def _market_close(self, position: PaperPosition, reason: str) -> None:
+        if position.id is None:
+            return
+        await self._cancel_algo_orders(position.symbol, position.direction)
+        rules = await self._symbol_rules(position.symbol)
+        quantity = self._round_down(
+            position.remaining_quantity or position.quantity,
+            rules["LOT_SIZE"].get("stepSize"),
+        )
+        if quantity <= 0:
+            await self._reconcile_position(position)
+            return
+        side = "SELL" if position.direction == Direction.LONG else "BUY"
+        result = await self.trading_client.new_order(
+            symbol=position.symbol,
+            side=side,
+            type="MARKET",
+            quantity=self._decimal_str(quantity),
+            reduceOnly="true",
+            **self._position_side(position.direction),
+        )
+        exit_price = float(result.get("avgPrice") or result.get("price") or 0)
+        if exit_price <= 0:
+            exit_price = position.entry_price
+        pnl, pct = self.planner._pnl(
+            position,
+            exit_price,
+            notional=position.remaining_notional_usdt or position.notional_usdt,
+        )
+        total_pnl = pnl + (position.take_profit_1_pnl_usdt or 0.0)
+        self.planner.storage.close_position(
+            position.id,
+            exit_time_ms=int(result.get("updateTime") or 0) or int(time.time() * 1000),
+            exit_price=exit_price,
+            exit_reason=reason,
+            pnl_usdt=total_pnl,
+            pnl_pct=total_pnl / position.notional_usdt if position.notional_usdt else pct,
+        )
+        logger.info(
+            "live position closed position_id=%s symbol=%s reason=%s exit=%.8g pnl_usdt=%.4f",
+            position.id,
+            position.symbol,
+            reason,
+            exit_price,
+            total_pnl,
+        )
+
+    async def _reconcile_position(self, position: PaperPosition) -> None:
+        account = await self.trading_client.account()
+        raw = next(
+            (
+                row for row in account.get("positions", [])
+                if row.get("symbol") == position.symbol
+                and row.get("positionSide") == self._position_side_value(position.direction)
+            ),
+            None,
+        )
+        if raw is not None and abs(float(raw.get("positionAmt") or 0)) > 0:
+            return
+        trades = await self.trading_client.user_trades(symbol=position.symbol, limit=1000)
+        exit_side = "SELL" if position.direction == Direction.LONG else "BUY"
+        tp1_time = int(position.take_profit_1_time_ms or 0)
+        exits = [
+            trade for trade in trades
+            if trade.get("positionSide") == self._position_side_value(position.direction)
+            and trade.get("side") == exit_side
+            and int(trade.get("time") or 0)
+            > (tp1_time if tp1_time else position.entry_time_ms)
+        ]
+        if not exits:
+            return
+        exit_quantity = sum(float(trade.get("qty") or 0) for trade in exits)
+        if exit_quantity <= 0:
+            return
+        exit_price = sum(
+            float(trade.get("price") or 0) * float(trade.get("qty") or 0)
+            for trade in exits
+        ) / exit_quantity
+        realized_pnl = sum(float(trade.get("realizedPnl") or 0) for trade in exits)
+        exit_time = max(int(trade.get("time") or 0) for trade in exits)
+        total_pnl = realized_pnl + (position.take_profit_1_pnl_usdt or 0.0)
+        self.planner.storage.close_position(
+            position.id,
+            exit_time_ms=exit_time,
+            exit_price=exit_price,
+            exit_reason="exchange_protection",
+            pnl_usdt=total_pnl,
+            pnl_pct=total_pnl / position.notional_usdt if position.notional_usdt else 0.0,
+        )
+        logger.info(
+            "live position reconciled from exchange position_id=%s symbol=%s "
+            "exit_price=%.8g realized_pnl=%.4f",
+            position.id,
+            position.symbol,
+            exit_price,
+            total_pnl,
+        )
+
+    async def _exchange_position_is_reduced(self, position: PaperPosition) -> bool:
+        account = await self.trading_client.account()
+        expected_side = self._position_side_value(position.direction)
+        raw = next(
+            (
+                row for row in account.get("positions", [])
+                if row.get("symbol") == position.symbol
+                and row.get("positionSide") == expected_side
+            ),
+            None,
+        )
+        if raw is None:
+            return False
+        exchange_quantity = abs(float(raw.get("positionAmt") or 0))
+        local_quantity = abs(float(position.remaining_quantity or position.quantity))
+        return exchange_quantity < local_quantity - 1e-9
+
+    async def _replace_protection_orders(self, position: PaperPosition) -> None:
+        await self._cancel_algo_orders(position.symbol, position.direction)
+        rules = await self._symbol_rules(position.symbol)
+        stop = self._round_down(position.stop_loss_price, rules["PRICE_FILTER"].get("tickSize"))
+        tp = self._round_down(
+            position.take_profit_1_price or position.take_profit_price,
+            rules["PRICE_FILTER"].get("tickSize"),
+        )
+        await self._place_protection_orders(
+            symbol=position.symbol,
+            direction=position.direction,
+            quantity=self._round_down(
+                position.remaining_quantity or position.quantity,
+                rules["LOT_SIZE"].get("stepSize"),
+            ),
+            stop_price=stop,
+            take_profit_price=tp,
+            symbol_rules=rules,
+            include_take_profit=not position.trailing_active,
+        )
+
+    async def _place_protection_orders(
+        self, *, symbol: str, direction: Direction, quantity: Decimal,
+        stop_price: Decimal, take_profit_price: Decimal,
+        symbol_rules: dict[str, dict[str, str]],
+        include_take_profit: bool = True,
+    ) -> tuple[dict, dict | None]:
+        exit_side = "SELL" if direction == Direction.LONG else "BUY"
+        position_side = self._position_side(direction)
+        stop = await self.trading_client.new_algo_order(
+            algoType="CONDITIONAL", symbol=symbol, side=exit_side, type="STOP_MARKET",
+            triggerPrice=self._decimal_str(stop_price), closePosition="true",
+            workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
+            **position_side,
+        )
+        tp = None
+        if include_take_profit and bool(self.planner.exit_config.get("scale_out_enabled", False)):
+            tp_quantity = self._round_down(
+                quantity * Decimal(str(self.planner.exit_config.get("first_take_profit_fraction", 0.5))),
+                symbol_rules["LOT_SIZE"].get("stepSize"),
+            )
+            if tp_quantity > 0:
+                tp = await self.trading_client.new_algo_order(
+                    algoType="CONDITIONAL", symbol=symbol, side=exit_side,
+                    type="TAKE_PROFIT_MARKET", triggerPrice=self._decimal_str(take_profit_price),
+                    quantity=self._decimal_str(tp_quantity), reduceOnly="true",
+                    workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
+                    **position_side,
+                )
+        elif include_take_profit:
+            tp = await self.trading_client.new_algo_order(
+                algoType="CONDITIONAL", symbol=symbol, side=exit_side,
+                type="TAKE_PROFIT_MARKET", triggerPrice=self._decimal_str(take_profit_price),
+                closePosition="true",
+                workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
+                **position_side,
+            )
+        return stop, tp
+
+    async def _cancel_algo_orders(self, symbol: str, direction: Direction) -> None:
+        orders = await self.trading_client.open_algo_orders(symbol=symbol)
+        expected_side = "LONG" if direction == Direction.LONG else "SHORT"
+        for order in orders:
+            if order.get("positionSide", expected_side) != expected_side:
+                continue
+            algo_id = order.get("algoId") or order.get("orderId")
+            if algo_id is not None:
+                await self.trading_client.cancel_algo_order(symbol=symbol, algoId=algo_id)
+
+    def _pivot_stop(self, position: PaperPosition, *, exclude_latest: bool = False) -> float | None:
+        window = int(position.trailing_pivot_window or self.planner.exit_config.get("trailing_pivot_window", 5))
+        history = list(self.closed_klines[position.symbol])
+        if exclude_latest:
+            history = history[:-1]
+        if len(history) < window:
+            return None
+        selected = history[-window:]
+        return (
+            min(k.low for k in selected)
+            if position.direction == Direction.LONG
+            else max(k.high for k in selected)
+        )
+
+    @staticmethod
+    def _effective_trailing_stop(position: PaperPosition, raw_pivot: float) -> float:
+        current = position.trailing_stop_price
+        if current is None:
+            return raw_pivot
+        return max(current, raw_pivot) if position.direction == Direction.LONG else min(current, raw_pivot)
+
+    @staticmethod
+    def _position_side_value(direction: Direction) -> str:
+        return "LONG" if direction == Direction.LONG else "SHORT"
 
     async def _symbol_rules(self, symbol: str) -> dict[str, dict[str, str]]:
         exchange_info = await self.trading_client.exchange_info()
