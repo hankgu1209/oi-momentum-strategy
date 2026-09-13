@@ -233,7 +233,16 @@ class MarketScanner:
     async def _consume_position_klines(self, symbols: set[str], interval: str) -> None:
         async for kline in self.client.kline_stream(symbols, interval=interval):
             if self.live_execution is not None:
-                await self.live_execution.update_position_kline(kline)
+                try:
+                    await self.live_execution.update_position_kline(kline)
+                except Exception:
+                    # A failed live management request must not terminate the
+                    # websocket task and silently stop protection monitoring.
+                    logger.exception(
+                        "live position kline processing failed symbol=%s close_time_ms=%s",
+                        kline.symbol,
+                        kline.close_time_ms,
+                    )
             else:
                 self.execution.update_position_kline(kline)
 

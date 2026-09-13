@@ -5,7 +5,7 @@ import time
 from collections import defaultdict, deque
 from decimal import Decimal
 
-from .binance import BinanceFuturesTradingClient
+from .binance import BinanceAPIError, BinanceFuturesTradingClient
 from .models import Direction, KlineClosed, PaperPosition, PositionStatus, SignalContext
 from .storage import SQLiteStorage
 
@@ -702,25 +702,55 @@ class LiveExecutionEngine:
     async def _market_close(self, position: PaperPosition, reason: str) -> None:
         if position.id is None:
             return
-        await self._cancel_algo_orders(position.symbol, position.direction)
         rules = await self._symbol_rules(position.symbol)
+        exchange_position = await self._exchange_position(position)
+        exchange_quantity = abs(float(exchange_position.get("positionAmt") or 0)) if exchange_position else 0.0
+        if exchange_quantity <= 0:
+            await self._cancel_algo_orders(position.symbol, position.direction)
+            await self._reconcile_position(position)
+            logger.info(
+                "live close skipped because exchange position is already flat "
+                "position_id=%s symbol=%s",
+                position.id,
+                position.symbol,
+            )
+            return
+
         quantity = self._round_down(
-            position.remaining_quantity or position.quantity,
+            min(position.remaining_quantity or position.quantity, exchange_quantity),
             rules["LOT_SIZE"].get("stepSize"),
         )
         if quantity <= 0:
+            await self._cancel_algo_orders(position.symbol, position.direction)
             await self._reconcile_position(position)
             return
         side = "SELL" if position.direction == Direction.LONG else "BUY"
         reduce_only = {} if bool(self.execution_config.get("hedge_mode", False)) else {"reduceOnly": "true"}
-        result = await self.trading_client.new_order(
-            symbol=position.symbol,
-            side=side,
-            type="MARKET",
-            quantity=self._decimal_str(quantity),
-            **reduce_only,
-            **self._position_side(position.direction),
-        )
+        try:
+            result = await self.trading_client.new_order(
+                symbol=position.symbol,
+                side=side,
+                type="MARKET",
+                quantity=self._decimal_str(quantity),
+                **reduce_only,
+                **self._position_side(position.direction),
+            )
+        except BinanceAPIError as exc:
+            if '"code":-2022' not in exc.message:
+                raise
+            # The position can disappear between the account read and the close
+            # request when an exchange protection order fills concurrently.
+            await self._reconcile_position(position)
+            logger.warning(
+                "live close rejected because exchange position changed position_id=%s "
+                "symbol=%s error=%s",
+                position.id,
+                position.symbol,
+                exc,
+            )
+            return
+
+        await self._cancel_algo_orders(position.symbol, position.direction)
         exit_price = float(result.get("avgPrice") or result.get("price") or 0)
         if exit_price <= 0:
             exit_price = position.entry_price
@@ -747,16 +777,22 @@ class LiveExecutionEngine:
             total_pnl,
         )
 
-    async def _reconcile_position(self, position: PaperPosition) -> None:
+    async def _exchange_position(self, position: PaperPosition) -> dict | None:
         account = await self.trading_client.account()
-        raw = next(
+        expected_side = self._position_side_value(position.direction)
+        if not bool(self.execution_config.get("hedge_mode", False)):
+            expected_side = "BOTH"
+        return next(
             (
                 row for row in account.get("positions", [])
                 if row.get("symbol") == position.symbol
-                and row.get("positionSide") == self._position_side_value(position.direction)
+                and row.get("positionSide", "BOTH") == expected_side
             ),
             None,
         )
+
+    async def _reconcile_position(self, position: PaperPosition) -> None:
+        raw = await self._exchange_position(position)
         if raw is not None and abs(float(raw.get("positionAmt") or 0)) > 0:
             return
         trades = await self.trading_client.user_trades(symbol=position.symbol, limit=1000)
@@ -799,16 +835,7 @@ class LiveExecutionEngine:
         )
 
     async def _exchange_position_is_reduced(self, position: PaperPosition) -> bool:
-        account = await self.trading_client.account()
-        expected_side = self._position_side_value(position.direction)
-        raw = next(
-            (
-                row for row in account.get("positions", [])
-                if row.get("symbol") == position.symbol
-                and row.get("positionSide") == expected_side
-            ),
-            None,
-        )
+        raw = await self._exchange_position(position)
         if raw is None:
             return False
         exchange_quantity = abs(float(raw.get("positionAmt") or 0))
