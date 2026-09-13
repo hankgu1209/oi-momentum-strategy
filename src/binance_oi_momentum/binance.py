@@ -314,6 +314,12 @@ class BinanceFuturesTradingClient:
     async def new_order(self, **params: Any) -> dict[str, Any]:
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
+    async def cancel_order(self, **params: Any) -> dict[str, Any]:
+        return await self._signed_request("DELETE", "/fapi/v1/order", params)
+
+    async def open_orders(self, **params: Any) -> list[dict[str, Any]]:
+        return await self._signed_request("GET", "/fapi/v1/openOrders", params)
+
     async def new_algo_order(self, **params: Any) -> dict[str, Any]:
         return await self._signed_request("POST", "/fapi/v1/algoOrder", params)
 

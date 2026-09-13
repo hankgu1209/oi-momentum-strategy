@@ -707,6 +707,7 @@ class LiveExecutionEngine:
         exchange_quantity = abs(float(exchange_position.get("positionAmt") or 0)) if exchange_position else 0.0
         if exchange_quantity <= 0:
             await self._cancel_algo_orders(position.symbol, position.direction)
+            await self._cancel_take_profit_orders(position.symbol, position.direction)
             await self._reconcile_position(position)
             logger.info(
                 "live close skipped because exchange position is already flat "
@@ -722,6 +723,7 @@ class LiveExecutionEngine:
         )
         if quantity <= 0:
             await self._cancel_algo_orders(position.symbol, position.direction)
+            await self._cancel_take_profit_orders(position.symbol, position.direction)
             await self._reconcile_position(position)
             return
         side = "SELL" if position.direction == Direction.LONG else "BUY"
@@ -751,6 +753,7 @@ class LiveExecutionEngine:
             return
 
         await self._cancel_algo_orders(position.symbol, position.direction)
+        await self._cancel_take_profit_orders(position.symbol, position.direction)
         exit_price = float(result.get("avgPrice") or result.get("price") or 0)
         if exit_price <= 0:
             exit_price = position.entry_price
@@ -844,6 +847,7 @@ class LiveExecutionEngine:
 
     async def _replace_protection_orders(self, position: PaperPosition) -> None:
         await self._cancel_algo_orders(position.symbol, position.direction)
+        await self._cancel_take_profit_orders(position.symbol, position.direction)
         rules = await self._symbol_rules(position.symbol)
         stop = self._round_down(position.stop_loss_price, rules["PRICE_FILTER"].get("tickSize"))
         tp = self._round_down(
@@ -884,21 +888,33 @@ class LiveExecutionEngine:
                 symbol_rules["LOT_SIZE"].get("stepSize"),
             )
             if tp_quantity > 0:
-                tp = await self.trading_client.new_algo_order(
-                    algoType="CONDITIONAL", symbol=symbol, side=exit_side,
-                    type="TAKE_PROFIT_MARKET", triggerPrice=self._decimal_str(take_profit_price),
-                    quantity=self._decimal_str(tp_quantity),
-                    workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
+                limit_params = {
+                    "symbol": symbol,
+                    "side": exit_side,
+                    "type": "LIMIT",
+                    "timeInForce": "GTC",
+                    "price": self._decimal_str(take_profit_price),
+                    "quantity": self._decimal_str(tp_quantity),
+                    "newClientOrderId": f"OIM-TP1-{symbol}-{self._position_side_value(direction)}",
                     **position_side,
-                )
+                }
+                if not bool(self.execution_config.get("hedge_mode", False)):
+                    limit_params["reduceOnly"] = "true"
+                tp = await self.trading_client.new_order(**limit_params)
         elif include_take_profit:
-            tp = await self.trading_client.new_algo_order(
-                algoType="CONDITIONAL", symbol=symbol, side=exit_side,
-                type="TAKE_PROFIT_MARKET", triggerPrice=self._decimal_str(take_profit_price),
-                closePosition="true",
-                workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
+            limit_params = {
+                "symbol": symbol,
+                "side": exit_side,
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "price": self._decimal_str(take_profit_price),
+                "quantity": self._decimal_str(quantity),
+                "newClientOrderId": f"OIM-TP1-{symbol}-{self._position_side_value(direction)}",
                 **position_side,
-            )
+            }
+            if not bool(self.execution_config.get("hedge_mode", False)):
+                limit_params["reduceOnly"] = "true"
+            tp = await self.trading_client.new_order(**limit_params)
         return stop, tp
 
     async def _cancel_algo_orders(self, symbol: str, direction: Direction) -> None:
@@ -910,6 +926,15 @@ class LiveExecutionEngine:
             algo_id = order.get("algoId") or order.get("orderId")
             if algo_id is not None:
                 await self.trading_client.cancel_algo_order(symbol=symbol, algoId=algo_id)
+
+    async def _cancel_take_profit_orders(self, symbol: str, direction: Direction) -> None:
+        client_order_id = f"OIM-TP1-{symbol}-{self._position_side_value(direction)}"
+        for order in await self.trading_client.open_orders(symbol=symbol):
+            if order.get("clientOrderId") != client_order_id:
+                continue
+            order_id = order.get("orderId")
+            if order_id is not None:
+                await self.trading_client.cancel_order(symbol=symbol, orderId=order_id)
 
     def _pivot_stop(self, position: PaperPosition, *, exclude_latest: bool = False) -> float | None:
         window = int(position.trailing_pivot_window or self.planner.exit_config.get("trailing_pivot_window", 5))
