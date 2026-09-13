@@ -712,12 +712,13 @@ class LiveExecutionEngine:
             await self._reconcile_position(position)
             return
         side = "SELL" if position.direction == Direction.LONG else "BUY"
+        reduce_only = {} if bool(self.execution_config.get("hedge_mode", False)) else {"reduceOnly": "true"}
         result = await self.trading_client.new_order(
             symbol=position.symbol,
             side=side,
             type="MARKET",
             quantity=self._decimal_str(quantity),
-            reduceOnly="true",
+            **reduce_only,
             **self._position_side(position.direction),
         )
         exit_price = float(result.get("avgPrice") or result.get("price") or 0)
