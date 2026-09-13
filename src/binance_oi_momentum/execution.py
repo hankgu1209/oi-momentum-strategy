@@ -859,7 +859,7 @@ class LiveExecutionEngine:
                 tp = await self.trading_client.new_algo_order(
                     algoType="CONDITIONAL", symbol=symbol, side=exit_side,
                     type="TAKE_PROFIT_MARKET", triggerPrice=self._decimal_str(take_profit_price),
-                    quantity=self._decimal_str(tp_quantity), reduceOnly="true",
+                    quantity=self._decimal_str(tp_quantity),
                     workingType=str(self.execution_config.get("working_type", "MARK_PRICE")),
                     **position_side,
                 )
